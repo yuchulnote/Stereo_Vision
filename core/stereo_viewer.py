@@ -20,6 +20,7 @@ sys.path.insert(0, str(project_root))
 from core.shared_buffer import SharedRingBuffer
 from utils.logger import get_logger
 from utils.camera_config import load_config
+from model.pose_detector import PoseDetector
 
 
 class StereoViewer:
@@ -74,6 +75,24 @@ class StereoViewer:
         # CPU 모니터링
         self.cpu_monitor_thread: Optional[threading.Thread] = None
         self.cpu_usage = 0.0
+        
+        # 포즈 감지기 초기화
+        # 두 카메라 각각에 대해 상태를 유지하기 위해 별도의 감지기 생성
+        self.use_pose_estimation = self.config.get('pose_estimation', {}).get('enabled', True)
+        if self.use_pose_estimation:
+            self.logger.info("MediaPipe 포즈 감지기 초기화 중...")
+            model_complexity = self.config.get('pose_estimation', {}).get('model_complexity', 1)
+            use_cuda = self.config.get('pose_estimation', {}).get('use_cuda', False)
+            
+            self.detector_0 = PoseDetector(
+                model_complexity=model_complexity,
+                use_cuda=use_cuda
+            )
+            self.detector_1 = PoseDetector(
+                model_complexity=model_complexity,
+                use_cuda=use_cuda
+            )
+            self.logger.info("MediaPipe 포즈 감지기 초기화 완료")
     
     def start_recording(self, output_path: str, fps: int = 30, codec: str = "XVID"):
         """비디오 녹화 시작"""
@@ -310,6 +329,16 @@ class StereoViewer:
                 self.draw_info(frame_0, 0, self.fps_0)
                 self.draw_info(frame_1, 1, self.fps_1)
                 
+                # 포즈 추정 (MediaPipe)
+                if self.use_pose_estimation:
+                    # 카메라 0 처리
+                    results_0 = self.detector_0.process(frame_0)
+                    self.detector_0.draw_landmarks(frame_0, results_0)
+                    
+                    # 카메라 1 처리
+                    results_1 = self.detector_1.process(frame_1)
+                    self.detector_1.draw_landmarks(frame_1, results_1)
+                
                 # 디버깅: 프레임 데이터 확인 (검은 화면 문제 해결)
                 if self.frame_count_combined % 30 == 0:  # 30프레임마다 한 번씩
                     mean_0 = np.mean(frame_0)
@@ -372,6 +401,13 @@ class StereoViewer:
         """정리 작업"""
         self.running = False
         self.stop_recording()
+        
+        # 감지기 리소스 해제
+        if hasattr(self, 'detector_0'):
+            self.detector_0.close()
+        if hasattr(self, 'detector_1'):
+            self.detector_1.close()
+            
         cv2.destroyAllWindows()
         self.logger.info("스테레오 뷰어 정리 완료")
 

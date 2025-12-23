@@ -67,6 +67,8 @@ stereo:
 
 # 포즈 추정 설정
 pose_estimation:
+  enabled: true
+  use_cuda: true  # CUDA 사용 요청 (지원되는 모델의 경우)
   # 모델 선택: "mediapipe" 또는 "rtmpose"
   model: "mediapipe"
   
