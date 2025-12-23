@@ -133,17 +133,23 @@ class SharedRingBuffer:
                                 pass
                 
                 # 이미지 데이터 복사
-                # frame.flatten()은 복사본을 생성할 수 있으므로, 버퍼에 직접 할당
-                # np.copyto가 더 효율적일 수 있음
+                # 성능 최적화: C-contiguous 뷰를 사용하여 불필요한 복사 방지
                 target_buffer = self.buffer[idx, :self.frame_size]
-                frame_flat = frame.ravel()  # ravel은 가능한 경우 뷰를 반환 (더 빠름)
+                
+                # 프레임이 C-contiguous인지 확인하고, 필요시 보장
+                if not frame.flags['C_CONTIGUOUS']:
+                    frame = np.ascontiguousarray(frame)
+                
+                # reshape를 사용하여 뷰만 생성 (복사 없음)
+                # frame_size = width * height * channels
+                frame_flat = frame.reshape(-1)  # 1D 뷰 생성 (복사 없음)
                 
                 # 데이터 크기 재확인
                 if frame_flat.nbytes != target_buffer.nbytes:
                     import sys
                     print(f"[ERROR] 데이터 크기 불일치: {frame_flat.nbytes} vs {target_buffer.nbytes}", file=sys.stderr)
                 else:
-                    # 버퍼에 데이터 복사
+                    # 버퍼에 데이터 복사 (np.copyto가 효율적)
                     np.copyto(target_buffer, frame_flat)
                 
                 # 메타데이터 저장 (타임스탬프 + 프레임 번호)

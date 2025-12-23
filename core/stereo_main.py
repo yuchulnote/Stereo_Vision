@@ -18,6 +18,7 @@ sys.path.insert(0, str(project_root))
 from core.shared_buffer import SharedRingBuffer
 from core.camera_producer import camera_producer_process
 from core.stereo_viewer import StereoViewer
+from core.pose_inference import pose_inference_process
 from utils.camera_config import load_config
 from utils.logger import get_logger
 import camera_test  # 카메라 선택 함수 사용
@@ -100,6 +101,14 @@ class StereoVisionSystem:
         # Producer 프로세스
         self.producer_0: Optional[mp.Process] = None
         self.producer_1: Optional[mp.Process] = None
+        
+        # 포즈 추론 프로세스
+        self.pose_inference_0: Optional[mp.Process] = None
+        self.pose_inference_1: Optional[mp.Process] = None
+        
+        # 포즈 추론 결과 큐
+        self.pose_queue_0: Optional[mp.Queue] = None
+        self.pose_queue_1: Optional[mp.Queue] = None
         
         # 뷰어
         self.viewer: Optional[StereoViewer] = None
@@ -369,6 +378,56 @@ class StereoVisionSystem:
             self.logger.error(f"Producer 프로세스 시작 실패: {e}")
             return False
     
+    def start_pose_inference(self):
+        """포즈 추론 프로세스 시작"""
+        try:
+            # 포즈 추론 사용 여부 확인
+            use_pose_estimation = self.config.get('pose_estimation', {}).get('enabled', True)
+            if not use_pose_estimation:
+                self.logger.info("포즈 추론이 비활성화되어 있습니다.")
+                return True
+            
+            # 포즈 추론 결과 큐 생성
+            self.pose_queue_0 = mp.Queue(maxsize=10)
+            self.pose_queue_1 = mp.Queue(maxsize=10)
+            
+            # 포즈 추론 프로세스 0 시작
+            self.pose_inference_0 = mp.Process(
+                target=pose_inference_process,
+                args=(
+                    self.camera_0_index,
+                    self.buffer_0,
+                    self.pose_queue_0,
+                    self.config_path
+                ),
+                name=f"PoseInference-{self.camera_0_index}"
+            )
+            self.pose_inference_0.start()
+            
+            # 포즈 추론 프로세스 1 시작
+            self.pose_inference_1 = mp.Process(
+                target=pose_inference_process,
+                args=(
+                    self.camera_1_index,
+                    self.buffer_1,
+                    self.pose_queue_1,
+                    self.config_path
+                ),
+                name=f"PoseInference-{self.camera_1_index}"
+            )
+            self.pose_inference_1.start()
+            
+            self.logger.info("포즈 추론 프로세스 시작 완료")
+            
+            # 프로세스 시작 대기
+            time.sleep(0.5)
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"포즈 추론 프로세스 시작 실패: {e}")
+            return False
+    
     def start_viewer(self):
         """뷰어 시작"""
         try:
@@ -376,7 +435,9 @@ class StereoVisionSystem:
                 buffer_0=self.buffer_0,
                 buffer_1=self.buffer_1,
                 config=self.config,
-                config_path=self.config_path
+                config_path=self.config_path,
+                pose_queue_0=self.pose_queue_0,
+                pose_queue_1=self.pose_queue_1
             )
             
             # 뷰어 실행 (블로킹)
@@ -400,6 +461,10 @@ class StereoVisionSystem:
             self.cleanup()
             return
         
+        # 포즈 추론 프로세스 시작
+        if not self.start_pose_inference():
+            self.logger.warning("포즈 추론 프로세스 시작 실패, 포즈 추론 없이 계속 진행")
+        
         try:
             # 뷰어 시작
             self.start_viewer()
@@ -418,6 +483,27 @@ class StereoVisionSystem:
                 self.logger.error(f"뷰어 정리 중 오류: {e}")
             finally:
                 self.viewer = None
+        
+        # 포즈 추론 프로세스 종료
+        if self.pose_inference_0 is not None:
+            if self.pose_inference_0.is_alive():
+                self.pose_inference_0.terminate()
+                self.pose_inference_0.join(timeout=5.0)
+                if self.pose_inference_0.is_alive():
+                    self.logger.warning("Pose Inference 0 강제 종료")
+                    self.pose_inference_0.kill()
+                    self.pose_inference_0.join()
+            self.pose_inference_0 = None
+        
+        if self.pose_inference_1 is not None:
+            if self.pose_inference_1.is_alive():
+                self.pose_inference_1.terminate()
+                self.pose_inference_1.join(timeout=5.0)
+                if self.pose_inference_1.is_alive():
+                    self.logger.warning("Pose Inference 1 강제 종료")
+                    self.pose_inference_1.kill()
+                    self.pose_inference_1.join()
+            self.pose_inference_1 = None
         
         # Producer 프로세스 종료
         if self.producer_0 is not None:

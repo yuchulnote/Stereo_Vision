@@ -11,36 +11,169 @@ import yaml
 from pathlib import Path
 import argparse
 
-def run_calibration(
+def run_intrinsic_calibration(
     image_dir: str = "data/calibration_images",
-    output_file: str = "calibration_result.yaml",
+    output_file: str = "intrinsic_calibration.yaml",
     square_size: float = 30.0,
-    chessboard_size: tuple = (8, 5) # (가로 내부 코너 수, 세로 내부 코너 수)
+    chessboard_size: tuple = (8, 5),  # (가로 내부 코너 수, 세로 내부 코너 수)
+    camera_side: str = "left"  # "left" or "right"
 ):
     """
-    스테레오 캘리브레이션 실행
+    개별 카메라 Intrinsic 캘리브레이션 실행
+    공장 출하 단계 혹은 렌즈 변경 시 1회 수행 (변하지 않음)
     
     Args:
         image_dir: 이미지가 저장된 디렉토리
         output_file: 결과 저장 파일 경로
         square_size: 체스보드 사각형 한 변의 길이 (mm)
         chessboard_size: (cols, rows) 내부 코너 개수
+        camera_side: "left" 또는 "right"
     """
-    print(f"캘리브레이션 시작...")
+    print(f"Intrinsic 캘리브레이션 시작 (카메라: {camera_side})...")
     print(f"  - 이미지 경로: {image_dir}")
     print(f"  - 체스보드 패턴: {chessboard_size}")
     print(f"  - 사각형 크기: {square_size} mm")
     
-    # 3D 월드 좌표점 생성 (체스보드 격자점의 실제 좌표)
-    # (0,0,0), (1,0,0), (2,0,0) ...., (cols-1, rows-1, 0)
+    # 3D 월드 좌표점 생성
     objp = np.zeros((chessboard_size[0] * chessboard_size[1], 3), np.float32)
     objp[:, :2] = np.mgrid[0:chessboard_size[0], 0:chessboard_size[1]].T.reshape(-1, 2)
     objp *= square_size
     
     # 코너점 저장 리스트
-    objpoints = [] # 3D points in real world space
-    imgpoints_l = [] # 2D points in left image plane
-    imgpoints_r = [] # 2D points in right image plane
+    objpoints = []
+    imgpoints = []
+    
+    # 이미지 파일 목록 가져오기
+    if camera_side == "left":
+        image_files = sorted(glob.glob(os.path.join(image_dir, "left_*.jpg")))
+    else:
+        image_files = sorted(glob.glob(os.path.join(image_dir, "right_*.jpg")))
+    
+    if len(image_files) < 10:
+        print(f"[경고] 이미지가 너무 적습니다 ({len(image_files)}장). 최소 10장 이상 권장합니다.")
+    
+    valid_count = 0
+    image_size = None
+    
+    print("\n[이미지 처리 중...]")
+    for img_path in image_files:
+        img = cv2.imread(img_path)
+        
+        if img is None:
+            continue
+            
+        if image_size is None:
+            image_size = (img.shape[1], img.shape[0])
+            
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # 체스보드 찾기
+        flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
+        ret, corners = cv2.findChessboardCorners(gray, chessboard_size, flags)
+        
+        if ret:
+            # 정밀도 향상 (Subpixel)
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+            corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+            
+            objpoints.append(objp)
+            imgpoints.append(corners)
+            valid_count += 1
+            print(f"  - OK: {os.path.basename(img_path)}")
+        else:
+            print(f"  - Skip (감지 실패): {os.path.basename(img_path)}")
+            
+    print(f"\n총 {len(image_files)}장 중 {valid_count}장 유효함.")
+    
+    if valid_count < 5:
+        print("[실패] 유효한 이미지가 너무 적어 캘리브레이션을 수행할 수 없습니다.")
+        return False
+        
+    # Intrinsic 캘리브레이션 수행
+    print("\n[Intrinsic 캘리브레이션 수행 중...]")
+    ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(
+        objpoints, imgpoints, image_size, None, None
+    )
+    
+    print(f"  - Reprojection Error: {ret:.4f}")
+    
+    # 결과 저장
+    data = {
+        'camera_matrix': mtx.tolist(),
+        'dist_coeffs': dist.tolist(),
+        'image_size': image_size,
+        'reprojection_error': ret,
+        'camera_side': camera_side,
+        'square_size': square_size,
+        'chessboard_size': chessboard_size
+    }
+    
+    with open(output_file, 'w') as f:
+        yaml.dump(data, f)
+        
+    print(f"\n[성공] Intrinsic 캘리브레이션 결과가 {output_file}에 저장되었습니다.")
+    return True
+
+
+def run_extrinsic_calibration(
+    image_dir: str = "data/calibration_images",
+    intrinsic_left_file: str = "intrinsic_calibration_left.yaml",
+    intrinsic_right_file: str = "intrinsic_calibration_right.yaml",
+    output_file: str = "extrinsic_calibration.yaml",
+    square_size: float = 30.0,
+    chessboard_size: tuple = (8, 5)  # (가로 내부 코너 수, 세로 내부 코너 수)
+):
+    """
+    스테레오 Extrinsic 캘리브레이션 실행
+    카메라 설치 시마다 수행 (카메라 간 상대 위치/자세 계산)
+    
+    Args:
+        image_dir: 이미지가 저장된 디렉토리
+        intrinsic_left_file: 왼쪽 카메라 Intrinsic 캘리브레이션 파일 경로
+        intrinsic_right_file: 오른쪽 카메라 Intrinsic 캘리브레이션 파일 경로
+        output_file: 결과 저장 파일 경로
+        square_size: 체스보드 사각형 한 변의 길이 (mm)
+        chessboard_size: (cols, rows) 내부 코너 개수
+    """
+    print(f"Extrinsic 캘리브레이션 시작...")
+    print(f"  - 이미지 경로: {image_dir}")
+    print(f"  - Intrinsic 파일 (왼쪽): {intrinsic_left_file}")
+    print(f"  - Intrinsic 파일 (오른쪽): {intrinsic_right_file}")
+    print(f"  - 체스보드 패턴: {chessboard_size}")
+    print(f"  - 사각형 크기: {square_size} mm")
+    
+    # Intrinsic 캘리브레이션 결과 로드
+    try:
+        with open(intrinsic_left_file, 'r') as f:
+            if hasattr(yaml, 'FullLoader'):
+                intrinsic_left = yaml.load(f, Loader=yaml.FullLoader)
+            else:
+                intrinsic_left = yaml.safe_load(f)
+        
+        with open(intrinsic_right_file, 'r') as f:
+            if hasattr(yaml, 'FullLoader'):
+                intrinsic_right = yaml.load(f, Loader=yaml.FullLoader)
+            else:
+                intrinsic_right = yaml.safe_load(f)
+    except Exception as e:
+        print(f"[오류] Intrinsic 캘리브레이션 파일 로드 실패: {e}")
+        return False
+    
+    mtx_l = np.array(intrinsic_left['camera_matrix'])
+    dist_l = np.array(intrinsic_left['dist_coeffs'])
+    mtx_r = np.array(intrinsic_right['camera_matrix'])
+    dist_r = np.array(intrinsic_right['dist_coeffs'])
+    image_size = tuple(intrinsic_left['image_size'])
+    
+    # 3D 월드 좌표점 생성
+    objp = np.zeros((chessboard_size[0] * chessboard_size[1], 3), np.float32)
+    objp[:, :2] = np.mgrid[0:chessboard_size[0], 0:chessboard_size[1]].T.reshape(-1, 2)
+    objp *= square_size
+    
+    # 코너점 저장 리스트
+    objpoints = []
+    imgpoints_l = []
+    imgpoints_r = []
     
     # 이미지 파일 목록 가져오기
     left_images = sorted(glob.glob(os.path.join(image_dir, "left_*.jpg")))
@@ -52,9 +185,8 @@ def run_calibration(
         
     if len(left_images) < 10:
         print(f"[경고] 이미지가 너무 적습니다 ({len(left_images)}장). 최소 10장 이상 권장합니다.")
-        
+    
     valid_pairs = 0
-    image_size = None
     
     print("\n[이미지 처리 중...]")
     for left_img_path, right_img_path in zip(left_images, right_images):
@@ -63,9 +195,6 @@ def run_calibration(
         
         if img_l is None or img_r is None:
             continue
-            
-        if image_size is None:
-            image_size = (img_l.shape[1], img_l.shape[0])
             
         gray_l = cv2.cvtColor(img_l, cv2.COLOR_BGR2GRAY)
         gray_r = cv2.cvtColor(img_r, cv2.COLOR_BGR2GRAY)
@@ -95,24 +224,12 @@ def run_calibration(
         print("[실패] 유효한 이미지가 너무 적어 캘리브레이션을 수행할 수 없습니다.")
         return False
         
-    # --- 1. 개별 카메라 캘리브레이션 (Intrinsic) ---
-    print("\n[개별 카메라 캘리브레이션 수행 중...]")
-    ret_l, mtx_l, dist_l, rvecs_l, tvecs_l = cv2.calibrateCamera(
-        objpoints, imgpoints_l, image_size, None, None
-    )
-    ret_r, mtx_r, dist_r, rvecs_r, tvecs_r = cv2.calibrateCamera(
-        objpoints, imgpoints_r, image_size, None, None
-    )
-    
-    print(f"  - Left Reprojection Error: {ret_l:.4f}")
-    print(f"  - Right Reprojection Error: {ret_r:.4f}")
-    
-    # --- 2. 스테레오 캘리브레이션 (Extrinsic) ---
-    print("\n[스테레오 캘리브레이션 수행 중...]")
+    # Extrinsic 캘리브레이션 수행 (Intrinsic 고정)
+    print("\n[Extrinsic 캘리브레이션 수행 중...]")
     flags = cv2.CALIB_FIX_INTRINSIC
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-5)
     
-    ret_stereo, mtx_l, dist_l, mtx_r, dist_r, R, T, E, F = cv2.stereoCalibrate(
+    ret_stereo, mtx_l_new, dist_l_new, mtx_r_new, dist_r_new, R, T, E, F = cv2.stereoCalibrate(
         objpoints, imgpoints_l, imgpoints_r,
         mtx_l, dist_l,
         mtx_r, dist_r,
@@ -124,8 +241,7 @@ def run_calibration(
     print(f"  - Stereo Reprojection Error: {ret_stereo:.4f}")
     print(f"  - Translation Vector (T):\n{T}")
     
-    # --- 3. 결과 저장 ---
-    # Numpy array는 yaml로 바로 저장이 안되므로 리스트로 변환
+    # 결과 저장
     data = {
         'camera_matrix_left': mtx_l.tolist(),
         'dist_coeffs_left': dist_l.tolist(),
@@ -142,16 +258,192 @@ def run_calibration(
     with open(output_file, 'w') as f:
         yaml.dump(data, f)
         
-    print(f"\n[성공] 결과가 {output_file}에 저장되었습니다.")
+    print(f"\n[성공] Extrinsic 캘리브레이션 결과가 {output_file}에 저장되었습니다.")
     return True
+
+
+def run_calibration(
+    image_dir: str = "data/calibration_images",
+    output_file: str = "calibration_result.yaml",
+    square_size: float = 30.0,
+    chessboard_size: tuple = (8, 5),  # (가로 내부 코너 수, 세로 내부 코너 수)
+    mode: str = "combined"  # "combined", "intrinsic", "extrinsic"
+):
+    """
+    스테레오 캘리브레이션 실행 (통합 또는 분리 모드)
+    
+    Args:
+        image_dir: 이미지가 저장된 디렉토리
+        output_file: 결과 저장 파일 경로
+        square_size: 체스보드 사각형 한 변의 길이 (mm)
+        chessboard_size: (cols, rows) 내부 코너 개수
+        mode: "combined" (기존 방식), "intrinsic" (Intrinsic만), "extrinsic" (Extrinsic만)
+    """
+    if mode == "combined":
+        # 기존 방식: Intrinsic과 Extrinsic을 한 번에 계산
+        print(f"캘리브레이션 시작...")
+        print(f"  - 이미지 경로: {image_dir}")
+        print(f"  - 체스보드 패턴: {chessboard_size}")
+        print(f"  - 사각형 크기: {square_size} mm")
+        
+        # 3D 월드 좌표점 생성 (체스보드 격자점의 실제 좌표)
+        # (0,0,0), (1,0,0), (2,0,0) ...., (cols-1, rows-1, 0)
+        objp = np.zeros((chessboard_size[0] * chessboard_size[1], 3), np.float32)
+        objp[:, :2] = np.mgrid[0:chessboard_size[0], 0:chessboard_size[1]].T.reshape(-1, 2)
+        objp *= square_size
+        
+        # 코너점 저장 리스트
+        objpoints = [] # 3D points in real world space
+        imgpoints_l = [] # 2D points in left image plane
+        imgpoints_r = [] # 2D points in right image plane
+        
+        # 이미지 파일 목록 가져오기
+        left_images = sorted(glob.glob(os.path.join(image_dir, "left_*.jpg")))
+        right_images = sorted(glob.glob(os.path.join(image_dir, "right_*.jpg")))
+        
+        if len(left_images) != len(right_images):
+            print(f"[오류] 왼쪽({len(left_images)})과 오른쪽({len(right_images)}) 이미지 개수가 다릅니다.")
+            return False
+            
+        if len(left_images) < 10:
+            print(f"[경고] 이미지가 너무 적습니다 ({len(left_images)}장). 최소 10장 이상 권장합니다.")
+            
+        valid_pairs = 0
+        image_size = None
+        
+        print("\n[이미지 처리 중...]")
+        for left_img_path, right_img_path in zip(left_images, right_images):
+            img_l = cv2.imread(left_img_path)
+            img_r = cv2.imread(right_img_path)
+            
+            if img_l is None or img_r is None:
+                continue
+                
+            if image_size is None:
+                image_size = (img_l.shape[1], img_l.shape[0])
+                
+            gray_l = cv2.cvtColor(img_l, cv2.COLOR_BGR2GRAY)
+            gray_r = cv2.cvtColor(img_r, cv2.COLOR_BGR2GRAY)
+            
+            # 체스보드 찾기
+            flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
+            ret_l, corners_l = cv2.findChessboardCorners(gray_l, chessboard_size, flags)
+            ret_r, corners_r = cv2.findChessboardCorners(gray_r, chessboard_size, flags)
+            
+            if ret_l and ret_r:
+                # 정밀도 향상 (Subpixel)
+                criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+                corners_l = cv2.cornerSubPix(gray_l, corners_l, (11, 11), (-1, -1), criteria)
+                corners_r = cv2.cornerSubPix(gray_r, corners_r, (11, 11), (-1, -1), criteria)
+                
+                objpoints.append(objp)
+                imgpoints_l.append(corners_l)
+                imgpoints_r.append(corners_r)
+                valid_pairs += 1
+                print(f"  - OK: {os.path.basename(left_img_path)}")
+            else:
+                print(f"  - Skip (감지 실패): {os.path.basename(left_img_path)}")
+                
+        print(f"\n총 {len(left_images)}장 중 {valid_pairs}장 유효함.")
+        
+        if valid_pairs < 5:
+            print("[실패] 유효한 이미지가 너무 적어 캘리브레이션을 수행할 수 없습니다.")
+            return False
+            
+        # --- 1. 개별 카메라 캘리브레이션 (Intrinsic) ---
+        print("\n[개별 카메라 캘리브레이션 수행 중...]")
+        ret_l, mtx_l, dist_l, rvecs_l, tvecs_l = cv2.calibrateCamera(
+            objpoints, imgpoints_l, image_size, None, None
+        )
+        ret_r, mtx_r, dist_r, rvecs_r, tvecs_r = cv2.calibrateCamera(
+            objpoints, imgpoints_r, image_size, None, None
+        )
+        
+        print(f"  - Left Reprojection Error: {ret_l:.4f}")
+        print(f"  - Right Reprojection Error: {ret_r:.4f}")
+        
+        # --- 2. 스테레오 캘리브레이션 (Extrinsic) ---
+        print("\n[스테레오 캘리브레이션 수행 중...]")
+        flags = cv2.CALIB_FIX_INTRINSIC
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-5)
+        
+        ret_stereo, mtx_l, dist_l, mtx_r, dist_r, R, T, E, F = cv2.stereoCalibrate(
+            objpoints, imgpoints_l, imgpoints_r,
+            mtx_l, dist_l,
+            mtx_r, dist_r,
+            image_size,
+            criteria=criteria,
+            flags=flags
+        )
+        
+        print(f"  - Stereo Reprojection Error: {ret_stereo:.4f}")
+        print(f"  - Translation Vector (T):\n{T}")
+        
+        # --- 3. 결과 저장 ---
+        # Numpy array는 yaml로 바로 저장이 안되므로 리스트로 변환
+        data = {
+            'camera_matrix_left': mtx_l.tolist(),
+            'dist_coeffs_left': dist_l.tolist(),
+            'camera_matrix_right': mtx_r.tolist(),
+            'dist_coeffs_right': dist_r.tolist(),
+            'R': R.tolist(),
+            'T': T.tolist(),
+            'E': E.tolist(),
+            'F': F.tolist(),
+            'image_size': image_size,
+            'reprojection_error': ret_stereo
+        }
+        
+        with open(output_file, 'w') as f:
+            yaml.dump(data, f)
+            
+        print(f"\n[성공] 결과가 {output_file}에 저장되었습니다.")
+        return True
+    
+    elif mode == "intrinsic":
+        # Intrinsic만 수행 (왼쪽과 오른쪽 각각)
+        print("Intrinsic 캘리브레이션 모드")
+        left_success = run_intrinsic_calibration(
+            image_dir=image_dir,
+            output_file="intrinsic_calibration_left.yaml",
+            square_size=square_size,
+            chessboard_size=chessboard_size,
+            camera_side="left"
+        )
+        right_success = run_intrinsic_calibration(
+            image_dir=image_dir,
+            output_file="intrinsic_calibration_right.yaml",
+            square_size=square_size,
+            chessboard_size=chessboard_size,
+            camera_side="right"
+        )
+        return left_success and right_success
+    
+    elif mode == "extrinsic":
+        # Extrinsic만 수행 (Intrinsic 파일 필요)
+        return run_extrinsic_calibration(
+            image_dir=image_dir,
+            intrinsic_left_file="intrinsic_calibration_left.yaml",
+            intrinsic_right_file="intrinsic_calibration_right.yaml",
+            output_file=output_file,
+            square_size=square_size,
+            chessboard_size=chessboard_size
+        )
+    
+    else:
+        print(f"[오류] 알 수 없는 모드: {mode}")
+        return False
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='스테레오 캘리브레이션 도구')
     parser.add_argument('--dir', type=str, default='data/calibration_images', help='이미지 폴더 경로')
     parser.add_argument('--out', type=str, default='calibration_result.yaml', help='결과 파일 경로')
-    parser.add_argument('--size', type=float, default=24.0, help='체스보드 사각형 한 변의 길이 (mm)')
+    parser.add_argument('--size', type=float, default=30.0, help='체스보드 사각형 한 변의 길이 (mm)')
     parser.add_argument('--cols', type=int, default=8, help='내부 코너 가로 개수')
     parser.add_argument('--rows', type=int, default=5, help='내부 코너 세로 개수')
+    parser.add_argument('--mode', type=str, default='combined', 
+                       choices=['combined', 'intrinsic', 'extrinsic'],
+                       help='캘리브레이션 모드: combined (통합), intrinsic (Intrinsic만), extrinsic (Extrinsic만)')
     
     args = parser.parse_args()
     
@@ -159,6 +451,7 @@ if __name__ == "__main__":
         image_dir=args.dir,
         output_file=args.out,
         square_size=args.size,
-        chessboard_size=(args.cols, args.rows)
+        chessboard_size=(args.cols, args.rows),
+        mode=args.mode
     )
 

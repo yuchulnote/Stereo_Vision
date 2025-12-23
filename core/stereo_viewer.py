@@ -47,7 +47,9 @@ class StereoViewer:
         buffer_0: SharedRingBuffer,
         buffer_1: SharedRingBuffer,
         config: Optional[Dict] = None,
-        config_path: str = "config.yaml"
+        config_path: str = "config.yaml",
+        pose_queue_0: Optional[mp.Queue] = None,
+        pose_queue_1: Optional[mp.Queue] = None
     ):
         """
         Args:
@@ -55,9 +57,13 @@ class StereoViewer:
             buffer_1: 카메라 1의 공유 메모리 버퍼
             config: 설정 딕셔너리
             config_path: 설정 파일 경로
+            pose_queue_0: 카메라 0의 포즈 추론 결과 큐
+            pose_queue_1: 카메라 1의 포즈 추론 결과 큐
         """
         self.buffer_0 = buffer_0
         self.buffer_1 = buffer_1
+        self.pose_queue_0 = pose_queue_0
+        self.pose_queue_1 = pose_queue_1
         
         if config is None:
             try:
@@ -92,22 +98,22 @@ class StereoViewer:
         self.cpu_monitor_thread: Optional[threading.Thread] = None
         self.cpu_usage = 0.0
         
-        # 포즈 감지기 초기화
+        # 포즈 추론 결과 큐 (별도 프로세스에서 받아옴)
+        # 포즈 추론 프로세스 (외부에서 주입됨)
+        self.pose_inference_0: Optional[mp.Process] = None
+        self.pose_inference_1: Optional[mp.Process] = None
+        
+        # 포즈 추론 사용 여부
         self.use_pose_estimation = self.config.get('pose_estimation', {}).get('enabled', True)
-        if self.use_pose_estimation:
-            self.logger.info("MediaPipe 포즈 감지기 초기화 중...")
-            model_complexity = self.config.get('pose_estimation', {}).get('model_complexity', 1)
-            use_cuda = self.config.get('pose_estimation', {}).get('use_cuda', False)
-            
-            self.detector_0 = PoseDetector(
-                model_complexity=model_complexity,
-                use_cuda=use_cuda
-            )
-            self.detector_1 = PoseDetector(
-                model_complexity=model_complexity,
-                use_cuda=use_cuda
-            )
-            self.logger.info("MediaPipe 포즈 감지기 초기화 완료")
+        
+        # 최신 포즈 추론 결과 캐시
+        self.latest_pose_result_0 = None
+        self.latest_pose_result_1 = None
+        
+        # MediaPipe 랜드마크 그리기용 (랜드마크 정보만 필요)
+        self.mp_pose = mp_lib.solutions.pose
+        self.mp_drawing = mp_lib.solutions.drawing_utils
+        self.mp_drawing_styles = mp_lib.solutions.drawing_styles
         
         # --- 시간 동기화 (Temporal Sync) 관련 초기화 ---
         self.sync_state = SyncState.IDLE
@@ -149,7 +155,18 @@ class StereoViewer:
             
         try:
             with open(path, 'r') as f:
-                data = yaml.safe_load(f)
+                # 튜플 태그를 처리하기 위해 FullLoader 또는 unsafe_load 사용
+                # FullLoader가 있으면 사용, 없으면 unsafe_load 사용
+                if hasattr(yaml, 'FullLoader'):
+                    try:
+                        data = yaml.load(f, Loader=yaml.FullLoader)
+                    except yaml.constructor.ConstructorError:
+                        # 튜플 태그가 있는 경우 unsafe_load 사용
+                        f.seek(0)
+                        data = yaml.unsafe_load(f)
+                else:
+                    # 구버전 호환
+                    data = yaml.unsafe_load(f)
                 
             # 데이터 로드 (List -> Numpy array 변환)
             mtx_l = np.array(data['camera_matrix_left'])
@@ -158,7 +175,16 @@ class StereoViewer:
             dist_r = np.array(data['dist_coeffs_right'])
             R = np.array(data['R'])
             T = np.array(data['T'])
-            image_size = tuple(data['image_size']) # (width, height)
+            
+            # image_size 처리 (튜플 또는 리스트 모두 처리)
+            image_size_data = data['image_size']
+            if isinstance(image_size_data, tuple):
+                image_size = image_size_data
+            elif isinstance(image_size_data, list):
+                image_size = tuple(image_size_data)
+            else:
+                # 예상치 못한 형식인 경우
+                image_size = tuple(image_size_data) if hasattr(image_size_data, '__iter__') else (1920, 1080)
             
             # Stereo Rectification
             # 두 이미지를 평행하게 만드는 회전/투영 행렬 계산
@@ -387,6 +413,45 @@ class StereoViewer:
             # 확실한 의도를 위해 코보다 약간 더 위(0.05 여유)일 때 인식
             return wrist.y < (nose.y - 0.05)
         return False
+    
+    def _draw_landmarks_from_data(self, image: np.ndarray, landmarks_data: list):
+        """
+        직렬화된 랜드마크 데이터로부터 skeleton 그리기
+        
+        Args:
+            image: 그릴 대상 이미지 (BGR)
+            landmarks_data: 랜드마크 딕셔너리 리스트
+        """
+        if not landmarks_data:
+            return
+        
+        h, w = image.shape[:2]
+        
+        # 랜드마크 포인트 그리기
+        for landmark_dict in landmarks_data:
+            if landmark_dict.get('visibility', 0) > 0.5:  # 가시성 체크
+                x = int(landmark_dict['x'] * w)
+                y = int(landmark_dict['y'] * h)
+                cv2.circle(image, (x, y), 5, (0, 255, 0), -1)
+        
+        # POSE_CONNECTIONS를 사용하여 연결선 그리기
+        # MediaPipe의 POSE_CONNECTIONS는 (start_idx, end_idx) 튜플 리스트
+        connections = self.mp_pose.POSE_CONNECTIONS
+        for connection in connections:
+            start_idx, end_idx = connection
+            if (start_idx < len(landmarks_data) and end_idx < len(landmarks_data) and
+                landmarks_data[start_idx].get('visibility', 0) > 0.5 and
+                landmarks_data[end_idx].get('visibility', 0) > 0.5):
+                
+                start_point = (
+                    int(landmarks_data[start_idx]['x'] * w),
+                    int(landmarks_data[start_idx]['y'] * h)
+                )
+                end_point = (
+                    int(landmarks_data[end_idx]['x'] * w),
+                    int(landmarks_data[end_idx]['y'] * h)
+                )
+                cv2.line(image, start_point, end_point, (0, 255, 0), 2)
 
     def draw_sync_guide(self, frame: np.ndarray):
         """동기화 가이드 UI 표시 (Step 11, Step 23)"""
@@ -600,20 +665,39 @@ class StereoViewer:
                 
                 self.update_fps()
                 
-                # 포즈 추정 (MediaPipe) & 데이터 수집
+                # 포즈 추론 결과 수집 (별도 프로세스에서 수행됨)
                 wrist_y_0 = None
                 wrist_y_1 = None
+                results_0 = None
+                results_1 = None
                 
                 if self.use_pose_estimation:
-                    # 카메라 0
-                    results_0 = self.detector_0.process(frame_0)
-                    self.detector_0.draw_landmarks(frame_0, results_0)
-                    wrist_y_0 = self._extract_wrist_y(results_0)
+                    # 큐에서 최신 추론 결과 가져오기 (Non-blocking)
+                    if self.pose_queue_0 is not None:
+                        try:
+                            while True:  # 최신 결과만 유지
+                                self.latest_pose_result_0 = self.pose_queue_0.get_nowait()
+                        except:
+                            pass
+                        
+                        if self.latest_pose_result_0 is not None:
+                            wrist_y_0 = self.latest_pose_result_0.wrist_y
+                            # 랜드마크 그리기
+                            if self.latest_pose_result_0.landmarks:
+                                self._draw_landmarks_from_data(frame_0, self.latest_pose_result_0.landmarks)
                     
-                    # 카메라 1
-                    results_1 = self.detector_1.process(frame_1)
-                    self.detector_1.draw_landmarks(frame_1, results_1)
-                    wrist_y_1 = self._extract_wrist_y(results_1)
+                    if self.pose_queue_1 is not None:
+                        try:
+                            while True:  # 최신 결과만 유지
+                                self.latest_pose_result_1 = self.pose_queue_1.get_nowait()
+                        except:
+                            pass
+                        
+                        if self.latest_pose_result_1 is not None:
+                            wrist_y_1 = self.latest_pose_result_1.wrist_y
+                            # 랜드마크 그리기
+                            if self.latest_pose_result_1.landmarks:
+                                self._draw_landmarks_from_data(frame_1, self.latest_pose_result_1.landmarks)
                 
                 # --- 캘리브레이션 모드 ---
                 calibration_ready = False
@@ -659,10 +743,15 @@ class StereoViewer:
                     elapsed_waiting = time.time() - self.waiting_start_time
                     
                     # 1초가 지난 후부터 제스처 확인
-                    if elapsed_waiting >= 1.0:
+                    if elapsed_waiting >= 2.0:
                         # 제스처 감지 (양쪽 카메라 중 하나라도 감지되면 OK)
-                        ready_0 = self._is_ready_pose(results_0) if self.use_pose_estimation else False
-                        ready_1 = self._is_ready_pose(results_1) if self.use_pose_estimation else False
+                        ready_0 = False
+                        ready_1 = False
+                        if self.use_pose_estimation:
+                            if self.latest_pose_result_0 is not None:
+                                ready_0 = self.latest_pose_result_0.ready_pose
+                            if self.latest_pose_result_1 is not None:
+                                ready_1 = self.latest_pose_result_1.ready_pose
                         
                         if ready_0 or ready_1:
                             self.sync_state = SyncState.COUNTDOWN
@@ -847,11 +936,7 @@ class StereoViewer:
         self.running = False
         self.stop_recording()
         
-        # 감지기 리소스 해제
-        if hasattr(self, 'detector_0'):
-            self.detector_0.close()
-        if hasattr(self, 'detector_1'):
-            self.detector_1.close()
-            
+        # 포즈 추론 프로세스는 외부에서 관리되므로 여기서는 정리하지 않음
+        
         cv2.destroyAllWindows()
         self.logger.info("스테레오 뷰어 정리 완료")
