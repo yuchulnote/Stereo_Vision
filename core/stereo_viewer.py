@@ -9,9 +9,10 @@ import numpy as np
 import multiprocessing as mp
 import time
 import threading
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 from pathlib import Path
 import sys
+from enum import Enum, auto
 
 # 프로젝트 루트를 경로에 추가
 project_root = Path(__file__).parent.parent
@@ -21,7 +22,18 @@ from core.shared_buffer import SharedRingBuffer
 from utils.logger import get_logger
 from utils.camera_config import load_config
 from model.pose_detector import PoseDetector
+from calibration.temporal_sync import TemporalSynchronizer
 
+import mediapipe as mp_lib
+
+class SyncState(Enum):
+    IDLE = auto()
+    WAITING_FOR_GESTURE = auto() # 사용자에게 동작 유도
+    COUNTDOWN = auto()           # 제스처 감지 후 카운트다운
+    BUFFERING = auto()           # 데이터 수집 중
+    CALCULATING = auto()         # 동기화 계산 중
+    SYNCED = auto()              # 동기화 완료
+    FAILED = auto()              # 동기화 실패
 
 class StereoViewer:
     """스테레오 비전 뷰어 클래스"""
@@ -77,7 +89,6 @@ class StereoViewer:
         self.cpu_usage = 0.0
         
         # 포즈 감지기 초기화
-        # 두 카메라 각각에 대해 상태를 유지하기 위해 별도의 감지기 생성
         self.use_pose_estimation = self.config.get('pose_estimation', {}).get('enabled', True)
         if self.use_pose_estimation:
             self.logger.info("MediaPipe 포즈 감지기 초기화 중...")
@@ -93,6 +104,17 @@ class StereoViewer:
                 use_cuda=use_cuda
             )
             self.logger.info("MediaPipe 포즈 감지기 초기화 완료")
+        
+        # --- 시간 동기화 (Temporal Sync) 관련 초기화 ---
+        self.sync_state = SyncState.IDLE
+        self.synchronizer = TemporalSynchronizer(fps=30.0) # FPS는 나중에 업데이트됨
+        self.sync_buffer_0: List[float] = [] # Y좌표 저장
+        self.sync_buffer_1: List[float] = []
+        self.sync_start_time = 0.0
+        self.countdown_start_time = 0.0
+        self.calculated_time_offset = 0.0 # ms 단위
+        self.last_sync_result = ""
+        self.sync_graphs = (None, None) # 시각화용 데이터
     
     def start_recording(self, output_path: str, fps: int = 30, codec: str = "XVID"):
         """비디오 녹화 시작"""
@@ -207,15 +229,22 @@ class StereoViewer:
         frame_0, ts_0, fn_0 = result_0
         frame_1, ts_1, fn_1 = result_1
         
+        # --- Soft-Genlock (Step 22) ---
+        # 계산된 오차만큼 ts_1 보정 (단위: ns)
+        # Offset이 양수(Lag)면 ts_1이 늦는 것이므로 ts_1을 앞당기거나(빼기) 
+        # 상대적 비교를 위해 보정. 
+        # 여기서는 오차 분석을 위해 원본 타임스탬프를 보정해서 반환
+        ts_1_corrected = ts_1 - int(self.calculated_time_offset * 1_000_000)
+        
         # 동기화 오차 계산 (Step 17)
-        sync_error_ns = abs(ts_0 - ts_1)
+        sync_error_ns = abs(ts_0 - ts_1_corrected)
         sync_error_ms = sync_error_ns / 1_000_000.0
         
         self.sync_errors.append(sync_error_ms)
         if len(self.sync_errors) > 100:
             self.sync_errors.pop(0)
         
-        return frame_0, frame_1, ts_0, ts_1
+        return frame_0, frame_1, ts_0, ts_1_corrected
     
     def update_fps(self):
         """FPS 업데이트"""
@@ -226,6 +255,10 @@ class StereoViewer:
             self.fps_0 = self.frame_count_0 / elapsed
             self.fps_1 = self.frame_count_1 / elapsed
             self.fps_combined = self.frame_count_combined / elapsed
+            
+            # Synchronizer FPS 업데이트
+            if self.fps_combined > 0:
+                self.synchronizer.fps = self.fps_combined
             
             self.frame_count_0 = 0
             self.frame_count_1 = 0
@@ -242,11 +275,9 @@ class StereoViewer:
     
     def draw_info(self, frame: np.ndarray, camera_idx: int, fps: float):
         """프레임에 정보 표시"""
-        height, width = frame.shape[:2]
-        
         # 배경
         overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (300, 120), (0, 0, 0), -1)
+        cv2.rectangle(overlay, (10, 10), (300, 160), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
         
         # 텍스트
@@ -259,9 +290,152 @@ class StereoViewer:
         
         if self.sync_errors:
             avg_sync = sum(self.sync_errors[-10:]) / len(self.sync_errors[-10:])
-            cv2.putText(frame, f"Sync: {avg_sync:.2f}ms", (20, 110),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    
+            color = (0, 255, 0) if avg_sync < 10.0 else (0, 0, 255)
+            cv2.putText(frame, f"SyncErr: {avg_sync:.2f}ms", (20, 110),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            
+        # 동기화 상태 표시
+        cv2.putText(frame, f"State: {self.sync_state.name}", (20, 135),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+        
+        if self.calculated_time_offset != 0:
+            cv2.putText(frame, f"Offset: {self.calculated_time_offset:.1f}ms", (20, 155),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
+
+    def _extract_wrist_y(self, results) -> Optional[float]:
+        """MediaPipe 결과에서 오른쪽 손목 Y좌표 추출"""
+        if results and results.pose_landmarks:
+            # RIGHT_WRIST = 16
+            wrist = results.pose_landmarks.landmark[mp_lib.solutions.pose.PoseLandmark.RIGHT_WRIST]
+            return wrist.y
+        return None
+
+    def _is_ready_pose(self, results) -> bool:
+        """오른쪽 손목이 코보다 위에 있는지 확인 (제스처 감지)"""
+        if results and results.pose_landmarks:
+            landmarks = results.pose_landmarks.landmark
+            nose = landmarks[mp_lib.solutions.pose.PoseLandmark.NOSE]
+            wrist = landmarks[mp_lib.solutions.pose.PoseLandmark.RIGHT_WRIST]
+            # y는 위쪽이 0이므로 작을수록 위에 있음
+            # 확실한 의도를 위해 코보다 약간 더 위(0.05 여유)일 때 인식
+            return wrist.y < (nose.y - 0.05)
+        return False
+
+    def draw_sync_guide(self, frame: np.ndarray):
+        """동기화 가이드 UI 표시 (Step 11, Step 23)"""
+        h, w = frame.shape[:2]
+        cx, cy = w // 2, h // 2
+        
+        # 폰트 스케일 및 위치 비례 계산
+        font_scale_large = min(w, h) / 600.0  # 기본 1.0 @ 600px
+        font_scale_small = font_scale_large * 0.6
+        y_offset_large = int(h * 0.1)
+        y_offset_small = int(h * 0.05)
+        
+        if self.sync_state == SyncState.WAITING_FOR_GESTURE:
+            msg1 = "RAISE RIGHT HAND"
+            msg2 = "above your head"
+            # 텍스트 사이즈 계산하여 중앙 정렬
+            (fw, fh), _ = cv2.getTextSize(msg1, cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, 3)
+            cv2.putText(frame, msg1, (cx - fw//2, cy - y_offset_small), cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, (0, 165, 255), 3)
+            
+            (fw2, fh2), _ = cv2.getTextSize(msg2, cv2.FONT_HERSHEY_SIMPLEX, font_scale_small, 2)
+            cv2.putText(frame, msg2, (cx - fw2//2, cy + y_offset_large), cv2.FONT_HERSHEY_SIMPLEX, font_scale_small, (255, 255, 255), 2)
+            
+        elif self.sync_state == SyncState.COUNTDOWN:
+            elapsed = time.time() - self.countdown_start_time
+            remaining = max(0.0, 1.5 - elapsed)
+            msg = f"HOLD... {remaining:.1f}"
+            (fw, fh), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, font_scale_large * 1.5, 3)
+            cv2.putText(frame, msg, (cx - fw//2, cy), cv2.FONT_HERSHEY_SIMPLEX, font_scale_large * 1.5, (0, 255, 255), 3)
+
+        elif self.sync_state == SyncState.BUFFERING:
+            elapsed = time.time() - self.sync_start_time
+            if elapsed < 1.0:
+                 msg = "DROP FAST!!!"
+                 (fw, fh), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, font_scale_large * 2.0, 4)
+                 cv2.putText(frame, msg, (cx - fw//2, cy), cv2.FONT_HERSHEY_SIMPLEX, font_scale_large * 2.0, (0, 0, 255), 4)
+            else:
+                 msg = f"Recording... {elapsed:.1f}s"
+                 (fw, fh), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, 2)
+                 cv2.putText(frame, msg, (cx - fw//2, cy), cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, (0, 255, 255), 2)
+            
+        elif self.sync_state == SyncState.CALCULATING:
+            msg = "CALCULATING..."
+            (fw, fh), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, 2)
+            cv2.putText(frame, msg, (cx - fw//2, cy), cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, (0, 255, 255), 2)
+
+        elif self.sync_state == SyncState.SYNCED:
+            # 동기화 결과 그래프 그리기
+            if self.sync_graphs and self.sync_graphs[0] is not None:
+                self._draw_signal_graph(frame, self.sync_graphs[0], self.sync_graphs[1])
+            
+            msg = f"SYNCED! Offset: {self.calculated_time_offset:.2f}ms"
+            (fw, fh), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, 2)
+            # 그래프 위쪽으로 위치 조정
+            cv2.putText(frame, msg, (cx - fw//2, cy - int(h * 0.2)), cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, (0, 255, 0), 2)
+            
+            msg2 = "Press 'S' to Retry"
+            (fw2, fh2), _ = cv2.getTextSize(msg2, cv2.FONT_HERSHEY_SIMPLEX, font_scale_small, 1)
+            cv2.putText(frame, msg2, (cx - fw2//2, cy + int(h * 0.3)), cv2.FONT_HERSHEY_SIMPLEX, font_scale_small, (200, 200, 200), 1)
+
+        elif self.sync_state == SyncState.FAILED:
+             msg = "SYNC FAILED. RETRY."
+             (fw, fh), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, 2)
+             cv2.putText(frame, msg, (cx - fw//2, cy), cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, (0, 0, 255), 2)
+
+    def _draw_signal_graph(self, frame: np.ndarray, sig1: np.ndarray, sig2: np.ndarray):
+        """두 신호 그래프 그리기 (OpenCV)"""
+        h, w = frame.shape[:2]
+        # 그래프 영역 설정 (화면 비율에 맞춤)
+        graph_w = int(w * 0.4)  # 화면 너비의 40%
+        graph_h = int(h * 0.25) # 화면 높이의 25%
+        x_start = (w - graph_w) // 2
+        y_start = (h - graph_h) // 2 + int(h * 0.1) # 화면 중앙보다 약간 아래
+        
+        # 배경 박스 (반투명)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x_start, y_start), (x_start + graph_w, y_start + graph_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+        
+        # 데이터 정규화 (그래프 높이에 맞춤)
+        # sig1, sig2는 이미 Z-score 정규화되어 있음 (대략 -3 ~ 3 범위)
+        # 이를 0 ~ graph_h 범위로 변환
+        def normalize_for_plot(sig):
+            if len(sig) == 0: return []
+            min_val, max_val = -3.0, 3.0 # Z-score 예상 범위
+            norm = (sig - min_val) / (max_val - min_val) # 0.0 ~ 1.0
+            norm = np.clip(norm, 0.0, 1.0)
+            return (norm * graph_h).astype(int)
+
+        pts1 = normalize_for_plot(sig1)
+        pts2 = normalize_for_plot(sig2)
+        
+        # 그리기
+        if len(pts1) > 1 and len(pts2) > 1:
+            # X축 간격
+            step = graph_w / len(pts1)
+            
+            for i in range(len(pts1) - 1):
+                x1 = int(x_start + i * step)
+                x2 = int(x_start + (i + 1) * step)
+                
+                # Cam 1 (Yellow)
+                y1_1 = int(y_start + graph_h - pts1[i])
+                y1_2 = int(y_start + graph_h - pts1[i+1])
+                cv2.line(frame, (x1, y1_1), (x2, y1_2), (0, 255, 255), 2)
+                
+                # Cam 2 (Magenta)
+                y2_1 = int(y_start + graph_h - pts2[i])
+                y2_2 = int(y_start + graph_h - pts2[i+1])
+                cv2.line(frame, (x1, y2_1), (x2, y2_2), (255, 0, 255), 2)
+
+        # 범례
+        font_scale = min(w, h) / 1000.0
+        cv2.putText(frame, "Cam 1 (Yellow)", (x_start, y_start - 10), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255), 1)
+        cv2.putText(frame, "Cam 2 (Magenta)", (x_start + int(graph_w * 0.5), y_start - 10), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 0, 255), 1)
+
+
     def run(self):
         """뷰어 실행"""
         self.running = True
@@ -276,10 +450,9 @@ class StereoViewer:
         
         self.logger.info("스테레오 뷰어 시작")
         
-        # 초기 프레임 대기 (Producer가 프레임을 쓰기 시작할 때까지)
-        self.logger.info("프레임 대기 중...")
+        # 초기 프레임 대기
         frame_wait_start = time.time()
-        frame_wait_timeout = 30.0  # 30초 타임아웃으로 증가 (초기화 지연 고려)
+        frame_wait_timeout = 30.0 
         
         try:
             while self.running:
@@ -289,31 +462,20 @@ class StereoViewer:
                 result = self.read_frames()
                 
                 if result is None:
-                    # 프레임이 없을 때 디버깅 정보
                     elapsed = time.time() - frame_wait_start
-                    if elapsed > 5.0 and elapsed < 5.1:  # 5초마다 한 번씩만 로그
-                        self.logger.warning(
-                            f"프레임을 읽지 못하고 있습니다. "
-                            f"대기 시간: {elapsed:.1f}초"
-                        )
-                        frame_wait_start = time.time()  # 리셋
+                    if elapsed > 5.0 and elapsed < 5.1:
+                        self.logger.warning(f"프레임 대기 중... ({elapsed:.1f}s)")
+                        frame_wait_start = time.time()
                     
                     if elapsed > frame_wait_timeout:
-                        self.logger.error(
-                            f"프레임 읽기 타임아웃 ({frame_wait_timeout}초). "
-                            f"카메라 Producer가 정상적으로 작동하는지 확인하세요."
-                        )
+                        self.logger.error("프레임 읽기 타임아웃")
                         break
                     
-                    time.sleep(0.01)  # 버퍼가 비어있으면 잠시 대기 (1ms -> 10ms로 증가)
+                    time.sleep(0.01)
                     continue
                 
                 # 프레임을 읽었으면 대기 시간 리셋
-                if frame_wait_start > 0:
-                    elapsed = time.time() - frame_wait_start
-                    if elapsed > 0.1:
-                        self.logger.info(f"첫 프레임 수신 (대기 시간: {elapsed:.2f}초)")
-                    frame_wait_start = 0  # 리셋
+                frame_wait_start = 0 
                 
                 frame_0, frame_1, ts_0, ts_1 = result
                 
@@ -322,48 +484,98 @@ class StereoViewer:
                 self.frame_count_1 += 1
                 self.frame_count_combined += 1
                 
-                # FPS 업데이트
                 self.update_fps()
                 
-                # 정보 표시
+                # 포즈 추정 (MediaPipe) & 데이터 수집
+                wrist_y_0 = None
+                wrist_y_1 = None
+                
+                if self.use_pose_estimation:
+                    # 카메라 0
+                    results_0 = self.detector_0.process(frame_0)
+                    self.detector_0.draw_landmarks(frame_0, results_0)
+                    wrist_y_0 = self._extract_wrist_y(results_0)
+                    
+                    # 카메라 1
+                    results_1 = self.detector_1.process(frame_1)
+                    self.detector_1.draw_landmarks(frame_1, results_1)
+                    wrist_y_1 = self._extract_wrist_y(results_1)
+                
+                # --- 동기화 로직 (State Machine) ---
+                if self.sync_state == SyncState.WAITING_FOR_GESTURE:
+                    # 제스처 감지 (양쪽 카메라 중 하나라도 감지되면 OK)
+                    ready_0 = self._is_ready_pose(results_0) if self.use_pose_estimation else False
+                    ready_1 = self._is_ready_pose(results_1) if self.use_pose_estimation else False
+                    
+                    if ready_0 or ready_1:
+                        self.sync_state = SyncState.COUNTDOWN
+                        self.countdown_start_time = time.time()
+                        self.logger.info("제스처 감지됨! 카운트다운 시작")
+
+                elif self.sync_state == SyncState.COUNTDOWN:
+                    elapsed = time.time() - self.countdown_start_time
+                    if elapsed > 1.5: # 1.5초 대기 후 시작
+                        self.sync_state = SyncState.BUFFERING
+                        self.sync_start_time = time.time()
+                        self.sync_buffer_0 = []
+                        self.sync_buffer_1 = []
+                        self.logger.info("데이터 버퍼링 시작...")
+
+                elif self.sync_state == SyncState.BUFFERING:
+                    # Step 12: 버퍼링
+                    if wrist_y_0 is not None and wrist_y_1 is not None:
+                        self.sync_buffer_0.append(wrist_y_0)
+                        self.sync_buffer_1.append(wrist_y_1)
+                    else:
+                        # 놓친 프레임은 이전 값이나 0으로 채우기 보단 일단 건너뛰거나 보간 필요
+                        # 간단하게는 None 처리 로직이 필요하지만 여기선 데이터가 있는 경우만 수집
+                        pass
+                    
+                    # 4초(약 120프레임 @ 30fps) 수집
+                    if time.time() - self.sync_start_time > 4.0:
+                        self.sync_state = SyncState.CALCULATING
+                
+                elif self.sync_state == SyncState.CALCULATING:
+                    # Step 13~20: 동기화 계산
+                    if len(self.sync_buffer_0) > 30 and len(self.sync_buffer_1) > 30:
+                        self.logger.info("동기화 계산 시작...")
+                        offset, corr, processed_signals = self.synchronizer.calculate_time_offset(
+                            self.sync_buffer_0, self.sync_buffer_1
+                        )
+                        
+                        # Step 21: 유효 범위 검증 (예: ±500ms)
+                        if abs(offset) < 500.0 and corr > 0.3: # 상관계수 임계값은 조정 필요
+                            self.calculated_time_offset = offset
+                            self.sync_graphs = processed_signals
+                            self.sync_state = SyncState.SYNCED
+                            self.logger.info(f"동기화 성공! Offset: {offset:.2f}ms")
+                        else:
+                            self.sync_state = SyncState.FAILED
+                            self.logger.warning(f"동기화 실패. Offset: {offset:.2f}ms, Corr: {corr:.3f}")
+                    else:
+                        self.sync_state = SyncState.FAILED
+                        self.logger.warning("데이터 부족으로 동기화 실패")
+                
+                # UI 표시
                 self.draw_info(frame_0, 0, self.fps_0)
                 self.draw_info(frame_1, 1, self.fps_1)
                 
-                # 포즈 추정 (MediaPipe)
-                if self.use_pose_estimation:
-                    # 카메라 0 처리
-                    results_0 = self.detector_0.process(frame_0)
-                    self.detector_0.draw_landmarks(frame_0, results_0)
-                    
-                    # 카메라 1 처리
-                    results_1 = self.detector_1.process(frame_1)
-                    self.detector_1.draw_landmarks(frame_1, results_1)
-                
-                # 디버깅: 프레임 데이터 확인 (검은 화면 문제 해결)
-                if self.frame_count_combined % 30 == 0:  # 30프레임마다 한 번씩
-                    mean_0 = np.mean(frame_0)
-                    mean_1 = np.mean(frame_1)
-                    if mean_0 < 1.0 or mean_1 < 1.0:
-                        self.logger.warning(
-                            f"검은 화면 감지됨 - 평균값: "
-                            f"Cam0={mean_0:.1f}, Cam1={mean_1:.1f}"
-                        )
-                
-                # 좌우 결합 (Step 20)
+                # 좌우 결합
                 combined_frame = np.hstack([frame_0, frame_1])
                 
-                # 비디오 녹화 (Step 22)
+                # 가이드 표시 (전체 화면 중앙)
+                self.draw_sync_guide(combined_frame)
+                
+                # 비디오 녹화
                 if self.recording and self.video_writer is not None:
                     self.video_writer.write(combined_frame)
                 
                 # 화면 표시
                 try:
-                    # 화면 표시용 리사이즈 (녹화는 원본 화질 유지)
-                    # 전체 너비가 1600px를 넘으면 리사이즈
                     display_frame = combined_frame
                     if display_frame.shape[1] > 1600:
-                        scale = 1600 / display_frame.shape[1]
-                        new_width = 1600
+                        scale = 1900 / display_frame.shape[1]
+                        new_width = 1900
                         new_height = int(display_frame.shape[0] * scale)
                         display_frame = cv2.resize(display_frame, (new_width, new_height))
                     
@@ -372,21 +584,29 @@ class StereoViewer:
                     self.logger.error(f"화면 표시 오류: {e}")
                     break
                 
-                # 처리 지연 시간 측정
                 latency_ms = (time.time() - start_time) * 1000
                 self.logger.update_latency(latency_ms)
                 
-                # 키 입력 처리 (waitKey는 화면 업데이트에도 필요)
+                # 키 입력 처리
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     break
                 elif key == ord('r'):
-                    # 녹화 토글
                     if not self.recording:
                         output_path = self.config.get('output', {}).get('video_path', 'output/stereo_output.avi')
                         self.start_recording(output_path)
                     else:
                         self.stop_recording()
+                elif key == ord('s'): # Sync 시작 진입
+                    self.sync_state = SyncState.WAITING_FOR_GESTURE
+                    self.sync_buffer_0 = []
+                    self.sync_buffer_1 = []
+                    self.logger.info("동기화 모드 진입: 사용자 제스처 대기")
+                elif key == ord(' ') and self.sync_state == SyncState.WAITING_FOR_GESTURE:
+                    # 수동 트리거 (백업용)
+                    self.sync_state = SyncState.BUFFERING
+                    self.sync_start_time = time.time()
+                    self.logger.info("데이터 버퍼링 시작 (수동 트리거)...")
                 
         except KeyboardInterrupt:
             self.logger.info("뷰어 중단 요청")
@@ -410,4 +630,3 @@ class StereoViewer:
             
         cv2.destroyAllWindows()
         self.logger.info("스테레오 뷰어 정리 완료")
-

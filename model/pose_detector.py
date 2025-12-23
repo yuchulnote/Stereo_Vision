@@ -101,4 +101,11 @@ class PoseDetector:
             
     def close(self):
         """자원 해제"""
-        self.pose.close()
+        try:
+            if hasattr(self, 'pose') and self.pose is not None:
+                self.pose.close()
+        except Exception as e:
+            # 이미 닫혔거나 해제된 경우 무시
+            pass
+        finally:
+            self.pose = None

@@ -412,8 +412,12 @@ class StereoVisionSystem:
         
         # 뷰어 정리
         if self.viewer is not None:
-            self.viewer.cleanup()
-            self.viewer = None
+            try:
+                self.viewer.cleanup()
+            except Exception as e:
+                self.logger.error(f"뷰어 정리 중 오류: {e}")
+            finally:
+                self.viewer = None
         
         # Producer 프로세스 종료
         if self.producer_0 is not None:
