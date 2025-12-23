@@ -329,7 +329,16 @@ class StereoViewer:
                 
                 # 화면 표시
                 try:
-                    cv2.imshow('Stereo Vision', combined_frame)
+                    # 화면 표시용 리사이즈 (녹화는 원본 화질 유지)
+                    # 전체 너비가 1600px를 넘으면 리사이즈
+                    display_frame = combined_frame
+                    if display_frame.shape[1] > 1600:
+                        scale = 1600 / display_frame.shape[1]
+                        new_width = 1600
+                        new_height = int(display_frame.shape[0] * scale)
+                        display_frame = cv2.resize(display_frame, (new_width, new_height))
+                    
+                    cv2.imshow('Stereo Vision', display_frame)
                 except Exception as e:
                     self.logger.error(f"화면 표시 오류: {e}")
                     break
