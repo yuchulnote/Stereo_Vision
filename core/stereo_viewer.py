@@ -14,6 +14,10 @@ from pathlib import Path
 import sys
 from enum import Enum, auto
 
+import os
+from datetime import datetime
+import yaml
+
 # 프로젝트 루트를 경로에 추가
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -115,7 +119,69 @@ class StereoViewer:
         self.calculated_time_offset = 0.0 # ms 단위
         self.last_sync_result = ""
         self.sync_graphs = (None, None) # 시각화용 데이터
+        
+        # --- 캘리브레이션(Calibration) 관련 초기화 ---
+        self.calibration_mode = False
+        self.chessboard_size = (8, 5) # 내부 코너 개수 (가로-1, 세로-1) -> 사각형 9x6 기준
+        self.capture_dir = Path(project_root) / "data" / "calibration_images"
+        self.capture_dir.mkdir(parents=True, exist_ok=True)
+        self.saved_count = 0
+        # 기존 저장된 파일 개수 확인
+        existing_files = list(self.capture_dir.glob("left_*.jpg"))
+        if existing_files:
+            self.saved_count = len(existing_files)
+            
+        # --- 정류(Rectification) 관련 초기화 ---
+        self.rectification_mode = False
+        self.calib_data = None
+        self.map_l1, self.map_l2 = None, None
+        self.map_r1, self.map_r2 = None, None
+        
+        # 캘리브레이션 결과 로드 시도
+        self.load_calibration()
     
+    def load_calibration(self, path="calibration_result.yaml"):
+        """캘리브레이션 결과 파일 로드 및 Rectification Map 생성"""
+        if not os.path.exists(path):
+            self.logger.warning(f"캘리브레이션 결과 파일이 없습니다: {path}")
+            return False
+            
+        try:
+            with open(path, 'r') as f:
+                data = yaml.safe_load(f)
+                
+            # 데이터 로드 (List -> Numpy array 변환)
+            mtx_l = np.array(data['camera_matrix_left'])
+            dist_l = np.array(data['dist_coeffs_left'])
+            mtx_r = np.array(data['camera_matrix_right'])
+            dist_r = np.array(data['dist_coeffs_right'])
+            R = np.array(data['R'])
+            T = np.array(data['T'])
+            image_size = tuple(data['image_size']) # (width, height)
+            
+            # Stereo Rectification
+            # 두 이미지를 평행하게 만드는 회전/투영 행렬 계산
+            R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
+                mtx_l, dist_l, mtx_r, dist_r, image_size, R, T
+            )
+            
+            # 매핑 테이블 생성 (이걸 미리 만들어둬야 실시간 처리가 빠름)
+            # m1type=cv2.CV_16SC2 (고정 소수점)가 CV_32FC1보다 빠름
+            self.map_l1, self.map_l2 = cv2.initUndistortRectifyMap(
+                mtx_l, dist_l, R1, P1, image_size, cv2.CV_16SC2
+            )
+            self.map_r1, self.map_r2 = cv2.initUndistortRectifyMap(
+                mtx_r, dist_r, R2, P2, image_size, cv2.CV_16SC2
+            )
+            
+            self.calib_data = data
+            self.logger.info("캘리브레이션 데이터 로드 및 Rectification Map 생성 완료")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"캘리브레이션 데이터 로드 실패: {e}")
+            return False
+
     def start_recording(self, output_path: str, fps: int = 30, codec: str = "XVID"):
         """비디오 녹화 시작"""
         try:
@@ -435,6 +501,42 @@ class StereoViewer:
         cv2.putText(frame, "Cam 1 (Yellow)", (x_start, y_start - 10), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255), 1)
         cv2.putText(frame, "Cam 2 (Magenta)", (x_start + int(graph_w * 0.5), y_start - 10), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 0, 255), 1)
 
+    def _process_calibration(self, frame_0, frame_1):
+        """캘리브레이션 모드 처리: 체스보드 찾기 및 그리기"""
+        # 그레이스케일 변환
+        gray_0 = cv2.cvtColor(frame_0, cv2.COLOR_BGR2GRAY)
+        gray_1 = cv2.cvtColor(frame_1, cv2.COLOR_BGR2GRAY)
+        
+        # 체스보드 찾기 (비용이 비싸므로 3프레임마다 하거나, 여기서 그냥 수행하고 느리면 조절)
+        # CALIB_CB_FAST_CHECK 플래그를 사용하면 없을 때 빨리 리턴함
+        flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE | cv2.CALIB_CB_FAST_CHECK
+        ret_0, corners_0 = cv2.findChessboardCorners(gray_0, self.chessboard_size, flags)
+        ret_1, corners_1 = cv2.findChessboardCorners(gray_1, self.chessboard_size, flags)
+        
+        # 찾았으면 그리기
+        if ret_0:
+            cv2.drawChessboardCorners(frame_0, self.chessboard_size, corners_0, ret_0)
+        if ret_1:
+            cv2.drawChessboardCorners(frame_1, self.chessboard_size, corners_1, ret_1)
+            
+        return ret_0 and ret_1 # 둘 다 찾았는지 여부 반환
+
+    def _process_rectification(self, frame_0, frame_1):
+        """이미지 정류 (Rectification) 및 수평선 그리기"""
+        if self.map_l1 is None:
+            return frame_0, frame_1
+            
+        # 1. Remap (왜곡 보정 + 평행 정렬)
+        rect_0 = cv2.remap(frame_0, self.map_l1, self.map_l2, cv2.INTER_LINEAR)
+        rect_1 = cv2.remap(frame_1, self.map_r1, self.map_r2, cv2.INTER_LINEAR)
+        
+        # 2. 수평선 그리기 (확인용)
+        h, w = rect_0.shape[:2]
+        for y in range(0, h, 30): # 30픽셀 간격
+            cv2.line(rect_0, (0, y), (w, y), (0, 255, 0), 1)
+            cv2.line(rect_1, (0, y), (w, y), (0, 255, 0), 1)
+            
+        return rect_0, rect_1
 
     def run(self):
         """뷰어 실행"""
@@ -501,8 +603,46 @@ class StereoViewer:
                     self.detector_1.draw_landmarks(frame_1, results_1)
                     wrist_y_1 = self._extract_wrist_y(results_1)
                 
+                # --- 캘리브레이션 모드 ---
+                calibration_ready = False
+                if self.calibration_mode:
+                    calibration_ready = self._process_calibration(frame_0, frame_1)
+                    
+                    # 캘리브레이션 상태 표시
+                    h, w = frame_0.shape[:2]
+                    status_color = (0, 255, 0) if calibration_ready else (0, 0, 255)
+                    status_text = "READY TO CAPTURE (Press SPACE)" if calibration_ready else "SEARCHING..."
+                    
+                    # 각 프레임 상단에 표시
+                    header_y = 30
+                    cv2.putText(frame_0, "CALIBRATION MODE", (w//2 - 100, header_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    cv2.putText(frame_1, "CALIBRATION MODE", (w//2 - 100, header_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    
+                    # 현재 패턴 사이즈 표시 (조절 안내)
+                    cols, rows = self.chessboard_size
+                    pattern_text = f"Corners: {cols}x{rows} (Squares: {cols+1}x{rows+1})"
+                    cv2.putText(frame_0, pattern_text, (20, header_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                    cv2.putText(frame_1, pattern_text, (20, header_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                    
+                    cv2.putText(frame_0, status_text, (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+                    cv2.putText(frame_1, status_text, (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+
+                # --- 정류(Rectification) 모드 ---
+                elif self.rectification_mode:
+                    if self.calib_data is not None:
+                        frame_0, frame_1 = self._process_rectification(frame_0, frame_1)
+                        
+                        # 상태 표시
+                        msg = "RECTIFICATION MODE"
+                        cv2.putText(frame_0, msg, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        cv2.putText(frame_1, msg, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    else:
+                        msg = "NO CALIBRATION DATA"
+                        cv2.putText(frame_0, msg, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                        cv2.putText(frame_1, msg, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
                 # --- 동기화 로직 (State Machine) ---
-                if self.sync_state == SyncState.WAITING_FOR_GESTURE:
+                elif self.sync_state == SyncState.WAITING_FOR_GESTURE:
                     # 제스처 감지 (양쪽 카메라 중 하나라도 감지되면 OK)
                     ready_0 = self._is_ready_pose(results_0) if self.use_pose_estimation else False
                     ready_1 = self._is_ready_pose(results_1) if self.use_pose_estimation else False
@@ -592,21 +732,77 @@ class StereoViewer:
                 if key == ord('q'):
                     break
                 elif key == ord('r'):
+                    # 정류 모드 토글 (녹화 키는 'v'로 변경 예정 또는 임시 비활성화)
+                    if self.calib_data is None:
+                        # 데이터가 없으면 로드 시도
+                        self.load_calibration()
+                    
+                    self.rectification_mode = not self.rectification_mode
+                    self.logger.info(f"정류 모드 {'시작' if self.rectification_mode else '종료'}")
+                
+                elif key == ord('v'): # Video Recording
                     if not self.recording:
                         output_path = self.config.get('output', {}).get('video_path', 'output/stereo_output.avi')
                         self.start_recording(output_path)
                     else:
                         self.stop_recording()
+                        
                 elif key == ord('s'): # Sync 시작 진입
-                    self.sync_state = SyncState.WAITING_FOR_GESTURE
-                    self.sync_buffer_0 = []
-                    self.sync_buffer_1 = []
-                    self.logger.info("동기화 모드 진입: 사용자 제스처 대기")
-                elif key == ord(' ') and self.sync_state == SyncState.WAITING_FOR_GESTURE:
-                    # 수동 트리거 (백업용)
-                    self.sync_state = SyncState.BUFFERING
+                    if not self.calibration_mode:
+                        self.sync_state = SyncState.WAITING_FOR_GESTURE
+                        self.sync_buffer_0 = []
+                        self.sync_buffer_1 = []
+                        self.logger.info("동기화 모드 진입: 사용자 제스처 대기")
+                elif key == ord('c'): # 캘리브레이션 모드 토글
+                    self.calibration_mode = not self.calibration_mode
+                    self.logger.info(f"캘리브레이션 모드 {'시작' if self.calibration_mode else '종료'}")
+                    
+                elif key == ord(' '):
+                    if self.calibration_mode:
+                        # 캘리브레이션 이미지 캡처
+                        if calibration_ready:
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                            path_0 = self.capture_dir / f"left_{timestamp}.jpg"
+                            path_1 = self.capture_dir / f"right_{timestamp}.jpg"
+                            
+                            cv2.imwrite(str(path_0), frame_0)
+                            cv2.imwrite(str(path_1), frame_1)
+                            
+                            self.saved_count += 1
+                            self.logger.info(f"캘리브레이션 이미지 저장 완료 ({self.saved_count}쌍): {path_0.name}")
+                            
+                            # 저장 확인 UI (잠시 반짝이거나 메시지)
+                            # 여기서는 간단히 로그로 대체하고 화면 깜빡임은 구현 복잡도상 생략
+                        else:
+                            self.logger.warning("체스보드가 감지되지 않아 캡처할 수 없습니다.")
+                    
+                    elif self.sync_state == SyncState.WAITING_FOR_GESTURE:
+                        # 수동 트리거 (백업용)
+                        self.sync_state = SyncState.BUFFERING
                     self.sync_start_time = time.time()
                     self.logger.info("데이터 버퍼링 시작 (수동 트리거)...")
+                
+                # 체스보드 크기 조절 (화살표 키)
+                elif self.calibration_mode:
+                    cols, rows = self.chessboard_size
+                    if key == 82: # Up Arrow (OpenCV waitKey code may vary by platform, trying standard)
+                        self.chessboard_size = (cols, rows + 1)
+                    elif key == 84: # Down Arrow
+                        self.chessboard_size = (cols, max(3, rows - 1))
+                    elif key == 83: # Right Arrow
+                        self.chessboard_size = (cols + 1, rows)
+                    elif key == 81: # Left Arrow
+                        self.chessboard_size = (max(3, cols - 1), rows)
+                    
+                    # 윈도우/리눅스 호환을 위해 확장 키 코드 처리 (255, 0 등)가 필요할 수 있으므로
+                    # 간단하게 wasd 키도 지원
+                    if key == ord('w'): self.chessboard_size = (cols, rows + 1)
+                    elif key == ord('s'): self.chessboard_size = (cols, max(3, rows - 1))
+                    elif key == ord('d'): self.chessboard_size = (cols + 1, rows)
+                    elif key == ord('a'): self.chessboard_size = (max(3, cols - 1), rows)
+                    
+                    if self.chessboard_size != (cols, rows):
+                        self.logger.info(f"체스보드 패턴 변경: {self.chessboard_size}")
                 
         except KeyboardInterrupt:
             self.logger.info("뷰어 중단 요청")
