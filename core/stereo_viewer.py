@@ -115,6 +115,7 @@ class StereoViewer:
         self.sync_buffer_0: List[float] = [] # Y좌표 저장
         self.sync_buffer_1: List[float] = []
         self.sync_start_time = 0.0
+        self.waiting_start_time = 0.0  # s키 입력 후 1초 대기 시작 시간
         self.countdown_start_time = 0.0
         self.calculated_time_offset = 0.0 # ms 단위
         self.last_sync_result = ""
@@ -399,14 +400,25 @@ class StereoViewer:
         y_offset_small = int(h * 0.05)
         
         if self.sync_state == SyncState.WAITING_FOR_GESTURE:
-            msg1 = "RAISE RIGHT HAND"
-            msg2 = "above your head"
-            # 텍스트 사이즈 계산하여 중앙 정렬
-            (fw, fh), _ = cv2.getTextSize(msg1, cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, 3)
-            cv2.putText(frame, msg1, (cx - fw//2, cy - y_offset_small), cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, (0, 165, 255), 3)
+            # s키 입력 후 경과 시간 계산
+            elapsed_waiting = time.time() - self.waiting_start_time
             
-            (fw2, fh2), _ = cv2.getTextSize(msg2, cv2.FONT_HERSHEY_SIMPLEX, font_scale_small, 2)
-            cv2.putText(frame, msg2, (cx - fw2//2, cy + y_offset_large), cv2.FONT_HERSHEY_SIMPLEX, font_scale_small, (255, 255, 255), 2)
+            if elapsed_waiting < 1.0:
+                # 1초 대기 중 메시지 표시
+                remaining = max(0.0, 1.0 - elapsed_waiting)
+                msg = f"준비 중... {remaining:.1f}"
+                (fw, fh), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, 3)
+                cv2.putText(frame, msg, (cx - fw//2, cy), cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, (255, 255, 0), 3)
+            else:
+                # 1초 후 제스처 안내 메시지 표시
+                msg1 = "RAISE RIGHT HAND"
+                msg2 = "above your head"
+                # 텍스트 사이즈 계산하여 중앙 정렬
+                (fw, fh), _ = cv2.getTextSize(msg1, cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, 3)
+                cv2.putText(frame, msg1, (cx - fw//2, cy - y_offset_small), cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, (0, 165, 255), 3)
+                
+                (fw2, fh2), _ = cv2.getTextSize(msg2, cv2.FONT_HERSHEY_SIMPLEX, font_scale_small, 2)
+                cv2.putText(frame, msg2, (cx - fw2//2, cy + y_offset_large), cv2.FONT_HERSHEY_SIMPLEX, font_scale_small, (255, 255, 255), 2)
             
         elif self.sync_state == SyncState.COUNTDOWN:
             elapsed = time.time() - self.countdown_start_time
@@ -643,14 +655,19 @@ class StereoViewer:
 
                 # --- 동기화 로직 (State Machine) ---
                 elif self.sync_state == SyncState.WAITING_FOR_GESTURE:
-                    # 제스처 감지 (양쪽 카메라 중 하나라도 감지되면 OK)
-                    ready_0 = self._is_ready_pose(results_0) if self.use_pose_estimation else False
-                    ready_1 = self._is_ready_pose(results_1) if self.use_pose_estimation else False
+                    # s키 입력 후 1초 대기
+                    elapsed_waiting = time.time() - self.waiting_start_time
                     
-                    if ready_0 or ready_1:
-                        self.sync_state = SyncState.COUNTDOWN
-                        self.countdown_start_time = time.time()
-                        self.logger.info("제스처 감지됨! 카운트다운 시작")
+                    # 1초가 지난 후부터 제스처 확인
+                    if elapsed_waiting >= 1.0:
+                        # 제스처 감지 (양쪽 카메라 중 하나라도 감지되면 OK)
+                        ready_0 = self._is_ready_pose(results_0) if self.use_pose_estimation else False
+                        ready_1 = self._is_ready_pose(results_1) if self.use_pose_estimation else False
+                        
+                        if ready_0 or ready_1:
+                            self.sync_state = SyncState.COUNTDOWN
+                            self.countdown_start_time = time.time()
+                            self.logger.info("제스처 감지됨! 카운트다운 시작")
 
                 elif self.sync_state == SyncState.COUNTDOWN:
                     elapsed = time.time() - self.countdown_start_time
@@ -663,38 +680,49 @@ class StereoViewer:
 
                 elif self.sync_state == SyncState.BUFFERING:
                     # Step 12: 버퍼링
+                    # 양쪽 손목이 모두 감지된 경우만 수집 (동기화를 위해 길이 일치 중요)
                     if wrist_y_0 is not None and wrist_y_1 is not None:
                         self.sync_buffer_0.append(wrist_y_0)
                         self.sync_buffer_1.append(wrist_y_1)
-                    else:
-                        # 놓친 프레임은 이전 값이나 0으로 채우기 보단 일단 건너뛰거나 보간 필요
-                        # 간단하게는 None 처리 로직이 필요하지만 여기선 데이터가 있는 경우만 수집
-                        pass
+                    # 손목이 감지되지 않은 프레임은 건너뜀 (두 버퍼의 길이를 일치시키기 위해)
                     
                     # 4초(약 120프레임 @ 30fps) 수집
-                    if time.time() - self.sync_start_time > 4.0:
-                        self.sync_state = SyncState.CALCULATING
+                    elapsed = time.time() - self.sync_start_time
+                    if elapsed > 4.0:
+                        # 최소한의 데이터 수 확인 (최소 60프레임 이상 필요)
+                        if len(self.sync_buffer_0) >= 60 and len(self.sync_buffer_1) >= 60:
+                            self.sync_state = SyncState.CALCULATING
+                        else:
+                            self.sync_state = SyncState.FAILED
+                            self.logger.warning(f"데이터 수집 부족: buffer_0={len(self.sync_buffer_0)}, buffer_1={len(self.sync_buffer_1)}")
+                            self.sync_buffer_0 = []
+                            self.sync_buffer_1 = []
                 
                 elif self.sync_state == SyncState.CALCULATING:
                     # Step 13~20: 동기화 계산
                     if len(self.sync_buffer_0) > 30 and len(self.sync_buffer_1) > 30:
-                        self.logger.info("동기화 계산 시작...")
+                        self.logger.info(f"동기화 계산 시작... (buffer_0: {len(self.sync_buffer_0)}, buffer_1: {len(self.sync_buffer_1)})")
                         offset, corr, processed_signals = self.synchronizer.calculate_time_offset(
                             self.sync_buffer_0, self.sync_buffer_1
                         )
                         
-                        # Step 21: 유효 범위 검증 (예: ±500ms)
-                        if abs(offset) < 500.0 and corr > 0.3: # 상관계수 임계값은 조정 필요
+                        # Step 21: 유효 범위 검증
+                        # 상관계수가 0.5 이상이어야 신뢰할 수 있음 (움직임이 적으면 낮은 상관계수 나옴)
+                        # offset이 -1.0이고 corr이 -1.0이면 움직임 부족으로 실패한 경우
+                        if corr < 0:
+                            self.sync_state = SyncState.FAILED
+                            self.logger.warning(f"동기화 실패: 움직임이 부족합니다. 팔을 빠르게 움직여주세요.")
+                        elif abs(offset) < 500.0 and corr > 0.5:  # 상관계수 임계값 상향 (0.3 -> 0.5)
                             self.calculated_time_offset = offset
                             self.sync_graphs = processed_signals
                             self.sync_state = SyncState.SYNCED
-                            self.logger.info(f"동기화 성공! Offset: {offset:.2f}ms")
+                            self.logger.info(f"동기화 성공! Offset: {offset:.2f}ms, Corr: {corr:.3f}")
                         else:
                             self.sync_state = SyncState.FAILED
-                            self.logger.warning(f"동기화 실패. Offset: {offset:.2f}ms, Corr: {corr:.3f}")
+                            self.logger.warning(f"동기화 실패. Offset: {offset:.2f}ms, Corr: {corr:.3f} (필요: >0.5, 범위: ±500ms)")
                     else:
                         self.sync_state = SyncState.FAILED
-                        self.logger.warning("데이터 부족으로 동기화 실패")
+                        self.logger.warning(f"데이터 부족으로 동기화 실패 (buffer_0: {len(self.sync_buffer_0)}, buffer_1: {len(self.sync_buffer_1)})")
                 
                 # UI 표시
                 self.draw_info(frame_0, 0, self.fps_0)
@@ -750,9 +778,10 @@ class StereoViewer:
                 elif key == ord('s'): # Sync 시작 진입
                     if not self.calibration_mode:
                         self.sync_state = SyncState.WAITING_FOR_GESTURE
+                        self.waiting_start_time = time.time()  # 1초 대기 시작 시간 기록
                         self.sync_buffer_0 = []
                         self.sync_buffer_1 = []
-                        self.logger.info("동기화 모드 진입: 사용자 제스처 대기")
+                        self.logger.info("동기화 모드 진입: 1초 후 제스처 확인 시작")
                 elif key == ord('c'): # 캘리브레이션 모드 토글
                     self.calibration_mode = not self.calibration_mode
                     self.logger.info(f"캘리브레이션 모드 {'시작' if self.calibration_mode else '종료'}")
