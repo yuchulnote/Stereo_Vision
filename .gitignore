@@ -1,0 +1,125 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+conda-env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# Project specific
+# 대용량 비디오 파일
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.wmv
+*.m4v
+
+# 모델 파일
+*.onnx
+*.pt
+*.pth
+*.pkl
+*.h5
+*.pb
+*.tflite
+models/*.onnx
+models/*.pt
+models/*.pth
+
+# 캘리브레이션 데이터
+calibration/*.npz
+calibration/*.pkl
+calibration/images/
+calibration/chessboard/
+
+# 로그 파일
+logs/
+*.log
+*.log.*
+
+# 임시 파일
+temp/
+tmp/
+*.tmp
+
+# 설정 파일 (민감 정보 포함 가능)
+config_local.yaml
+.env
+.env.local
+
+# 데이터 파일
+data/
+datasets/
+*.db
+*.sqlite
+*.sqlite3
+
+# 빌드 산출물
+*.exe
+*.dll
+*.dylib
+*.so
+*.pyd
+
+# Cython
+*.c
+*.html
+
+# OS
+Thumbs.db
+.DS_Store
+

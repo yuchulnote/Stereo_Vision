@@ -1,0 +1,119 @@
+# -*- coding: utf-8 -*-
+# 스테레오 비전 프로젝트 설정 파일
+# 카메라 설정값을 고정하여 플리커 현상 방지
+
+# 카메라 설정
+cameras:
+  # 카메라 0 설정
+  camera_0:
+    index: 0
+    # 해상도 설정
+    width: 1920
+    height: 1080
+    # FPS 설정
+    fps: 30
+    # 자동 노출 비활성화 (플리커 방지)
+    auto_exposure: true
+    # exposure: -6  # 수동 노출 값 (-13 ~ 1, 기본값: -6)
+    # 화이트 밸런스 고정
+    auto_white_balance: true
+    # white_balance: 5000  # 켈빈 온도 (일반적으로 3000-8000)
+    # 포커스 고정
+    auto_focus: true
+    # focus: 50  # 포커스 값 (0-255, 기본값: 50)
+    # 밝기
+    brightness: 128  # 0-255
+    # 대비
+    contrast: 128  # 0-255
+    # 채도
+    saturation: 128  # 0-255
+    # 선명도
+    sharpness: 128  # 0-255
+    # 버퍼 크기 (셔터 랙 최소화를 위해 1 권장)
+    buffer_size: 1
+    
+  # 카메라 1 설정
+  camera_1:
+    index: 1
+    width: 1920
+    height: 1080
+    fps: 30
+    auto_exposure: true
+    # exposure: -6
+    auto_white_balance: true
+    # white_balance: 5000
+    auto_focus: true
+    # focus: 50
+    brightness: 128
+    contrast: 128
+    saturation: 128
+    sharpness: 128
+    # 버퍼 크기 (셔터 랙 최소화를 위해 1 권장)
+    buffer_size: 1
+
+# 스테레오 비전 설정
+stereo:
+  # 동기화 설정
+  sync_threshold_ms: 33  # 프레임 동기화 임계값 (밀리초)
+  
+  # 캘리브레이션 파일 경로
+  calibration_file: "calibration/stereo_calibration.npz"
+  
+  # 깊이 맵 설정
+  depth:
+    min_depth: 0.1  # 최소 깊이 (미터)
+    max_depth: 10.0  # 최대 깊이 (미터)
+    use_wls_filter: true  # Weighted Least Squares 필터 사용
+
+# 포즈 추정 설정
+pose_estimation:
+  # 모델 선택: "mediapipe" 또는 "rtmpose"
+  model: "mediapipe"
+  
+  # MediaPipe 설정
+  mediapipe:
+    model_complexity: 1  # 0, 1, 2 (높을수록 정확하지만 느림)
+    min_detection_confidence: 0.5
+    min_tracking_confidence: 0.5
+    enable_segmentation: false
+    
+  # RTMPose 설정 (사용 시)
+  rtmpose:
+    config_file: "models/rtmpose_config.py"
+    checkpoint_file: "models/rtmpose_checkpoint.pth"
+    device: "cuda"  # "cuda" 또는 "cpu"
+
+# 로깅 설정
+logging:
+  # 로그 레벨: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO"
+  
+  # 로그 파일 경로
+  file_path: "logs/stereo_vision.log"
+  
+  # 로그 파일 최대 크기 (MB)
+  max_file_size_mb: 100
+  
+  # 백업 파일 개수
+  backup_count: 5
+  
+  # 성능 메트릭 로깅
+  performance:
+    log_fps: true
+    log_latency: true
+    log_sync_error: true
+    log_interval_seconds: 1.0  # 로그 기록 간격
+
+# 출력 설정
+output:
+  # 비디오 저장
+  save_video: false
+  video_path: "output/stereo_output.avi"
+  video_codec: "XVID"
+  video_fps: 30
+  
+  # 이미지 저장
+  save_images: false
+  image_path: "output/frames"
+  save_interval_frames: 30  # N 프레임마다 저장
+

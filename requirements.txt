@@ -1,0 +1,41 @@
+# Core dependencies
+numpy>=1.24.0
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0
+scipy>=1.10.0
+
+# Deep Learning & Inference
+torch>=2.0.0
+torchvision>=0.15.0
+onnxruntime-gpu>=1.16.0  # GPU 가속용, CPU만 사용 시 onnxruntime 사용
+
+# Visualization & Logging
+rerun-sdk>=0.15.0
+matplotlib>=3.7.0
+
+# MediaPipe (포즈 추정용)
+mediapipe>=0.10.0
+
+# Configuration
+pyyaml>=6.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-asyncio>=0.21.0
+
+# Development tools
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.5.0
+
+# System monitoring
+psutil>=5.9.0  # CPU 모니터링용
+
+# Optional: RTMPose dependencies (필요시)
+# mmcv>=2.0.0
+# mmpose>=1.0.0
+
+# Optional: Windows 카메라 이름 조회 (camera_test.py에서 사용)
+pygrabber>=0.1; sys_platform == "win32"
+
