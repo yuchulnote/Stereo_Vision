@@ -267,7 +267,7 @@ def run_calibration(
     output_file: str = "calibration_result.yaml",
     square_size: float = 30.0,
     chessboard_size: tuple = (8, 5),  # (가로 내부 코너 수, 세로 내부 코너 수)
-    mode: str = "combined"  # "combined", "intrinsic", "extrinsic"
+    mode: str = "extrinsic"  # "combined", "intrinsic", "extrinsic"
 ):
     """
     스테레오 캘리브레이션 실행 (통합 또는 분리 모드)

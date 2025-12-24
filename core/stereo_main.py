@@ -437,7 +437,9 @@ class StereoVisionSystem:
                 config=self.config,
                 config_path=self.config_path,
                 pose_queue_0=self.pose_queue_0,
-                pose_queue_1=self.pose_queue_1
+                pose_queue_1=self.pose_queue_1,
+                pose_inference_0=self.pose_inference_0,
+                pose_inference_1=self.pose_inference_1
             )
             
             # 뷰어 실행 (블로킹)

@@ -49,7 +49,9 @@ class StereoViewer:
         config: Optional[Dict] = None,
         config_path: str = "config.yaml",
         pose_queue_0: Optional[mp.Queue] = None,
-        pose_queue_1: Optional[mp.Queue] = None
+        pose_queue_1: Optional[mp.Queue] = None,
+        pose_inference_0: Optional[mp.Process] = None,
+        pose_inference_1: Optional[mp.Process] = None
     ):
         """
         Args:
@@ -59,11 +61,15 @@ class StereoViewer:
             config_path: 설정 파일 경로
             pose_queue_0: 카메라 0의 포즈 추론 결과 큐
             pose_queue_1: 카메라 1의 포즈 추론 결과 큐
+            pose_inference_0: 카메라 0의 포즈 추론 프로세스
+            pose_inference_1: 카메라 1의 포즈 추론 프로세스
         """
         self.buffer_0 = buffer_0
         self.buffer_1 = buffer_1
         self.pose_queue_0 = pose_queue_0
         self.pose_queue_1 = pose_queue_1
+        self.pose_inference_0 = pose_inference_0
+        self.pose_inference_1 = pose_inference_1
         
         if config is None:
             try:
@@ -98,13 +104,11 @@ class StereoViewer:
         self.cpu_monitor_thread: Optional[threading.Thread] = None
         self.cpu_usage = 0.0
         
-        # 포즈 추론 결과 큐 (별도 프로세스에서 받아옴)
-        # 포즈 추론 프로세스 (외부에서 주입됨)
-        self.pose_inference_0: Optional[mp.Process] = None
-        self.pose_inference_1: Optional[mp.Process] = None
-        
         # 포즈 추론 사용 여부
         self.use_pose_estimation = self.config.get('pose_estimation', {}).get('enabled', True)
+        
+        # 포즈 추정 프로세스가 중지되었는지 추적 (캘리브레이션 모드용)
+        self.pose_inference_stopped = False
         
         # 최신 포즈 추론 결과 캐시
         self.latest_pose_result_0 = None
@@ -468,14 +472,14 @@ class StereoViewer:
             # s키 입력 후 경과 시간 계산
             elapsed_waiting = time.time() - self.waiting_start_time
             
-            if elapsed_waiting < 1.0:
-                # 1초 대기 중 메시지 표시
-                remaining = max(0.0, 1.0 - elapsed_waiting)
+            if elapsed_waiting < 5.0:
+                # 5초 대기 중 메시지 표시
+                remaining = max(0.0, 5.0 - elapsed_waiting)
                 msg = f"준비 중... {remaining:.1f}"
                 (fw, fh), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, 3)
                 cv2.putText(frame, msg, (cx - fw//2, cy), cv2.FONT_HERSHEY_SIMPLEX, font_scale_large, (255, 255, 0), 3)
             else:
-                # 1초 후 제스처 안내 메시지 표시
+                # 5초 후 제스처 안내 메시지 표시
                 msg1 = "RAISE RIGHT HAND"
                 msg2 = "above your head"
                 # 텍스트 사이즈 계산하여 중앙 정렬
@@ -671,7 +675,8 @@ class StereoViewer:
                 results_0 = None
                 results_1 = None
                 
-                if self.use_pose_estimation:
+                # 캘리브레이션 모드일 때는 포즈 추정 사용 안 함
+                if self.use_pose_estimation and not self.calibration_mode:
                     # 큐에서 최신 추론 결과 가져오기 (Non-blocking)
                     if self.pose_queue_0 is not None:
                         try:
@@ -739,11 +744,11 @@ class StereoViewer:
 
                 # --- 동기화 로직 (State Machine) ---
                 elif self.sync_state == SyncState.WAITING_FOR_GESTURE:
-                    # s키 입력 후 1초 대기
+                    # s키 입력 후 5초 대기
                     elapsed_waiting = time.time() - self.waiting_start_time
                     
-                    # 1초가 지난 후부터 제스처 확인
-                    if elapsed_waiting >= 2.0:
+                    # 5초가 지난 후부터 제스처 확인
+                    if elapsed_waiting >= 5.0:
                         # 제스처 감지 (양쪽 카메라 중 하나라도 감지되면 OK)
                         ready_0 = False
                         ready_1 = False
@@ -867,13 +872,22 @@ class StereoViewer:
                 elif key == ord('s'): # Sync 시작 진입
                     if not self.calibration_mode:
                         self.sync_state = SyncState.WAITING_FOR_GESTURE
-                        self.waiting_start_time = time.time()  # 1초 대기 시작 시간 기록
+                        self.waiting_start_time = time.time()  # 5초 대기 시작 시간 기록
                         self.sync_buffer_0 = []
                         self.sync_buffer_1 = []
-                        self.logger.info("동기화 모드 진입: 1초 후 제스처 확인 시작")
+                        self.logger.info("동기화 모드 진입: 5초 후 제스처 확인 시작")
                 elif key == ord('c'): # 캘리브레이션 모드 토글
                     self.calibration_mode = not self.calibration_mode
                     self.logger.info(f"캘리브레이션 모드 {'시작' if self.calibration_mode else '종료'}")
+                    
+                    # 캘리브레이션 모드 진입 시 포즈 추정 프로세스 중지
+                    if self.calibration_mode:
+                        self._stop_pose_inference()
+                    else:
+                        # 캘리브레이션 모드 종료 시 포즈 추정 프로세스 재시작
+                        # 주의: 프로세스 재시작은 복잡하므로 현재는 중지만 수행
+                        # 필요시 재시작 로직 추가 가능
+                        pass
                     
                 elif key == ord(' '):
                     if self.calibration_mode:
@@ -930,6 +944,30 @@ class StereoViewer:
             traceback.print_exc()
         finally:
             self.cleanup()
+    
+    def _stop_pose_inference(self):
+        """포즈 추정 프로세스 중지 (캘리브레이션 모드용)"""
+        if self.pose_inference_stopped:
+            return  # 이미 중지됨
+        
+        if self.pose_inference_0 is not None and self.pose_inference_0.is_alive():
+            self.pose_inference_0.terminate()
+            self.pose_inference_0.join(timeout=2.0)
+            if self.pose_inference_0.is_alive():
+                self.pose_inference_0.kill()
+                self.pose_inference_0.join()
+            self.logger.info("포즈 추정 프로세스 0 중지 완료")
+        
+        if self.pose_inference_1 is not None and self.pose_inference_1.is_alive():
+            self.pose_inference_1.terminate()
+            self.pose_inference_1.join(timeout=2.0)
+            if self.pose_inference_1.is_alive():
+                self.pose_inference_1.kill()
+                self.pose_inference_1.join()
+            self.logger.info("포즈 추정 프로세스 1 중지 완료")
+        
+        self.pose_inference_stopped = True
+        self.use_pose_estimation = False  # 포즈 추정 결과 사용 안 함
     
     def cleanup(self):
         """정리 작업"""
