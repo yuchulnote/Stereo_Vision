@@ -752,12 +752,18 @@ class StereoViewer:
                 
                 # --- 캘리브레이션 모드 ---
                 calibration_ready = False
+                original_frame_0 = None
+                original_frame_1 = None
                 if self.calibration_mode:
+                    # 원본 프레임 복사 (캡쳐용)
+                    original_frame_0 = frame_0.copy()
+                    original_frame_1 = frame_1.copy()
+                    # 체스보드 찾기 및 그리기 (화면 표시용)
                     calibration_ready = self._process_calibration(frame_0, frame_1)
                     
-                    # 자동 캡쳐 로직
+                    # 자동 캡쳐 로직 (원본 프레임 사용)
                     if self.auto_capture_enabled:
-                        self._handle_auto_capture(calibration_ready, frame_0, frame_1)
+                        self._handle_auto_capture(calibration_ready, original_frame_0, original_frame_1)
                     
                     # 캘리브레이션 상태 표시
                     h, w = frame_0.shape[:2]
@@ -974,14 +980,18 @@ class StereoViewer:
                     
                 elif key == ord(' '):
                     if self.calibration_mode:
-                        # 캘리브레이션 이미지 캡처
+                        # 캘리브레이션 이미지 캡처 (원본 프레임 사용)
                         if calibration_ready:
+                            # 원본 프레임이 없으면 현재 프레임 사용 (fallback)
+                            save_frame_0 = original_frame_0 if original_frame_0 is not None else frame_0
+                            save_frame_1 = original_frame_1 if original_frame_1 is not None else frame_1
+                            
                             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                             path_0 = self.capture_dir / f"left_{timestamp}.jpg"
                             path_1 = self.capture_dir / f"right_{timestamp}.jpg"
                             
-                            cv2.imwrite(str(path_0), frame_0)
-                            cv2.imwrite(str(path_1), frame_1)
+                            cv2.imwrite(str(path_0), save_frame_0)
+                            cv2.imwrite(str(path_1), save_frame_1)
                             
                             self.saved_count += 1
                             self.logger.info(f"캘리브레이션 이미지 저장 완료 ({self.saved_count}쌍): {path_0.name}")
