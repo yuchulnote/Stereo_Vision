@@ -141,6 +141,15 @@ class StereoViewer:
         existing_files = list(self.capture_dir.glob("left_*.jpg"))
         if existing_files:
             self.saved_count = len(existing_files)
+        
+        # 자동 캡쳐 관련 초기화
+        self.auto_capture_enabled = False
+        self.stable_detection_frames = 0  # 연속으로 감지된 프레임 수
+        self.last_capture_time = 0.0  # 마지막 캡쳐 시간
+        self.min_images = 20  # 최소 이미지 수
+        self.max_images = 50  # 최대 이미지 수
+        self.capture_interval = 2.0  # 캡쳐 간격 (초)
+        self.stable_frames_required = 10  # 안정적으로 감지되어야 하는 프레임 수
             
         # --- 정류(Rectification) 관련 초기화 ---
         self.rectification_mode = False
@@ -601,6 +610,43 @@ class StereoViewer:
             cv2.drawChessboardCorners(frame_1, self.chessboard_size, corners_1, ret_1)
             
         return ret_0 and ret_1 # 둘 다 찾았는지 여부 반환
+    
+    def _handle_auto_capture(self, calibration_ready: bool, frame_0, frame_1):
+        """자동 캡쳐 처리"""
+        current_time = time.time()
+        
+        # 최대 이미지 수에 도달하면 중지
+        if self.saved_count >= self.max_images:
+            return
+        
+        # 체스보드가 감지되면 안정성 카운터 증가
+        if calibration_ready:
+            self.stable_detection_frames += 1
+        else:
+            # 감지되지 않으면 리셋
+            self.stable_detection_frames = 0
+        
+        # 안정적으로 감지되고, 캡쳐 간격이 지났으면 자동 캡쳐
+        if (self.stable_detection_frames >= self.stable_frames_required and 
+            current_time - self.last_capture_time >= self.capture_interval):
+            
+            # 이미지 저장
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            path_0 = self.capture_dir / f"left_{timestamp}.jpg"
+            path_1 = self.capture_dir / f"right_{timestamp}.jpg"
+            
+            cv2.imwrite(str(path_0), frame_0)
+            cv2.imwrite(str(path_1), frame_1)
+            
+            self.saved_count += 1
+            self.last_capture_time = current_time
+            self.stable_detection_frames = 0  # 캡쳐 후 리셋
+            
+            self.logger.info(f"자동 캡쳐 완료 ({self.saved_count}/{self.max_images}): {path_0.name}")
+            
+            # 최소 이미지 수에 도달했는지 확인
+            if self.saved_count >= self.min_images:
+                self.logger.info(f"최소 이미지 수 달성: {self.saved_count}장")
 
     def _process_rectification(self, frame_0, frame_1):
         """이미지 정류 (Rectification) 및 수평선 그리기"""
@@ -709,10 +755,26 @@ class StereoViewer:
                 if self.calibration_mode:
                     calibration_ready = self._process_calibration(frame_0, frame_1)
                     
+                    # 자동 캡쳐 로직
+                    if self.auto_capture_enabled:
+                        self._handle_auto_capture(calibration_ready, frame_0, frame_1)
+                    
                     # 캘리브레이션 상태 표시
                     h, w = frame_0.shape[:2]
                     status_color = (0, 255, 0) if calibration_ready else (0, 0, 255)
-                    status_text = "READY TO CAPTURE (Press SPACE)" if calibration_ready else "SEARCHING..."
+                    
+                    # 상태 텍스트 결정
+                    if self.auto_capture_enabled:
+                        if self.saved_count >= self.max_images:
+                            status_text = f"AUTO CAPTURE COMPLETE ({self.saved_count}/{self.max_images})"
+                            status_color = (0, 255, 255)
+                        elif calibration_ready:
+                            stable_pct = (self.stable_detection_frames / self.stable_frames_required) * 100
+                            status_text = f"AUTO CAPTURE: Stable {self.stable_detection_frames}/{self.stable_frames_required} ({stable_pct:.0f}%)"
+                        else:
+                            status_text = "AUTO CAPTURE: SEARCHING..."
+                    else:
+                        status_text = "READY TO CAPTURE (Press SPACE)" if calibration_ready else "SEARCHING..."
                     
                     # 각 프레임 상단에 표시
                     header_y = 30
@@ -724,6 +786,11 @@ class StereoViewer:
                     pattern_text = f"Corners: {cols}x{rows} (Squares: {cols+1}x{rows+1})"
                     cv2.putText(frame_0, pattern_text, (20, header_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                     cv2.putText(frame_1, pattern_text, (20, header_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                    
+                    # 저장된 이미지 수 표시
+                    count_text = f"Captured: {self.saved_count}/{self.max_images}"
+                    cv2.putText(frame_0, count_text, (20, header_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.putText(frame_1, count_text, (20, header_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                     
                     cv2.putText(frame_0, status_text, (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
                     cv2.putText(frame_1, status_text, (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
@@ -883,11 +950,27 @@ class StereoViewer:
                     # 캘리브레이션 모드 진입 시 포즈 추정 프로세스 중지
                     if self.calibration_mode:
                         self._stop_pose_inference()
+                        # 자동 캡쳐 모드도 초기화
+                        self.auto_capture_enabled = False
+                        self.stable_detection_frames = 0
                     else:
                         # 캘리브레이션 모드 종료 시 포즈 추정 프로세스 재시작
                         # 주의: 프로세스 재시작은 복잡하므로 현재는 중지만 수행
                         # 필요시 재시작 로직 추가 가능
+                        self.auto_capture_enabled = False
                         pass
+                
+                elif key == ord('a'): # 자동 캡쳐 모드 토글 (캘리브레이션 모드에서만 작동)
+                    if self.calibration_mode:
+                        self.auto_capture_enabled = not self.auto_capture_enabled
+                        if self.auto_capture_enabled:
+                            self.stable_detection_frames = 0
+                            self.last_capture_time = time.time()
+                            self.logger.info(f"자동 캡쳐 모드 시작 (목표: {self.min_images}~{self.max_images}장)")
+                        else:
+                            self.logger.info("자동 캡쳐 모드 종료")
+                    else:
+                        self.logger.warning("자동 캡쳐는 캘리브레이션 모드에서만 사용 가능합니다. 'c' 키로 캘리브레이션 모드를 먼저 활성화하세요.")
                     
                 elif key == ord(' '):
                     if self.calibration_mode:
@@ -915,7 +998,8 @@ class StereoViewer:
                     self.logger.info("데이터 버퍼링 시작 (수동 트리거)...")
                 
                 # 체스보드 크기 조절 (화살표 키)
-                elif self.calibration_mode:
+                elif self.calibration_mode and not self.auto_capture_enabled:
+                    # 자동 캡쳐 모드가 아닐 때만 체스보드 크기 조절 가능
                     cols, rows = self.chessboard_size
                     if key == 82: # Up Arrow (OpenCV waitKey code may vary by platform, trying standard)
                         self.chessboard_size = (cols, rows + 1)
@@ -927,11 +1011,11 @@ class StereoViewer:
                         self.chessboard_size = (max(3, cols - 1), rows)
                     
                     # 윈도우/리눅스 호환을 위해 확장 키 코드 처리 (255, 0 등)가 필요할 수 있으므로
-                    # 간단하게 wasd 키도 지원
+                    # 간단하게 wasd 키도 지원 (단, 'a'는 자동 캡쳐 모드 토글로 사용)
                     if key == ord('w'): self.chessboard_size = (cols, rows + 1)
                     elif key == ord('s'): self.chessboard_size = (cols, max(3, rows - 1))
                     elif key == ord('d'): self.chessboard_size = (cols + 1, rows)
-                    elif key == ord('a'): self.chessboard_size = (max(3, cols - 1), rows)
+                    # 'a' 키는 자동 캡쳐 모드 토글로 사용하므로 여기서는 제외
                     
                     if self.chessboard_size != (cols, rows):
                         self.logger.info(f"체스보드 패턴 변경: {self.chessboard_size}")
