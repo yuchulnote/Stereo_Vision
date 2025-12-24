@@ -27,6 +27,8 @@ from utils.logger import get_logger
 from utils.camera_config import load_config
 from model.pose_detector import PoseDetector
 from calibration.temporal_sync import TemporalSynchronizer
+from motion_capture.mocap_3d import MotionCapture3D
+from motion_capture.visualizer import MotionCaptureVisualizer
 
 import mediapipe as mp_lib
 
@@ -159,6 +161,27 @@ class StereoViewer:
         
         # 캘리브레이션 결과 로드 시도
         self.load_calibration()
+        
+        # 3D 모션캡쳐 초기화 (Step 8, 9, 10)
+        self.mocap_3d: Optional[MotionCapture3D] = None
+        self.mocap_visualizer: Optional[MotionCaptureVisualizer] = None
+        self.mocap_enabled = False
+        if self.calib_data is not None:
+            try:
+                self.mocap_3d = MotionCapture3D(
+                    calibration_data=self.calib_data,
+                    confidence_threshold=0.6,
+                    use_midpoint=True,
+                    filter_enabled=True
+                )
+                self.mocap_visualizer = MotionCaptureVisualizer(
+                    export_csv=True,
+                    csv_path="output/mocap_data.csv",
+                    use_matplotlib=True
+                )
+                self.logger.info("3D 모션캡쳐 시스템 초기화 완료")
+            except Exception as e:
+                self.logger.warning(f"3D 모션캡쳐 초기화 실패: {e}")
     
     def load_calibration(self, path="calibration_result.yaml"):
         """캘리브레이션 결과 파일 로드 및 Rectification Map 생성"""
@@ -201,8 +224,11 @@ class StereoViewer:
             
             # Stereo Rectification
             # 두 이미지를 평행하게 만드는 회전/투영 행렬 계산
+            # alpha=0: 유효 영역만 남김 (Zoom in), alpha=1: 모든 픽셀 포함 (Zoom out, 검은 영역 포함)
+            # 현재 캘리브레이션 오차가 크므로 전체를 보기 위해 alpha=1로 설정
             R1, R2, P1, P2, Q, roi1, roi2 = cv2.stereoRectify(
-                mtx_l, dist_l, mtx_r, dist_r, image_size, R, T
+                mtx_l, dist_l, mtx_r, dist_r, image_size, R, T,
+                alpha=1
             )
             
             # 매핑 테이블 생성 (이걸 미리 만들어둬야 실시간 처리가 빠름)
@@ -441,20 +467,39 @@ class StereoViewer:
         h, w = image.shape[:2]
         
         # 랜드마크 포인트 그리기
-        for landmark_dict in landmarks_data:
-            if landmark_dict.get('visibility', 0) > 0.5:  # 가시성 체크
+        # visibility 임계값을 낮춰서 더 많은 랜드마크를 그리도록 함
+        visibility_threshold = 0.3  # 0.5에서 0.3으로 낮춤
+        for i, landmark_dict in enumerate(landmarks_data):
+            visibility = landmark_dict.get('visibility', 0.0)
+            if visibility > visibility_threshold:
                 x = int(landmark_dict['x'] * w)
                 y = int(landmark_dict['y'] * h)
-                cv2.circle(image, (x, y), 5, (0, 255, 0), -1)
+                # visibility에 따라 색상 강도 조절
+                color_intensity = int(255 * min(1.0, visibility))
+                cv2.circle(image, (x, y), 5, (0, color_intensity, 0), -1)
         
         # POSE_CONNECTIONS를 사용하여 연결선 그리기
         # MediaPipe의 POSE_CONNECTIONS는 (start_idx, end_idx) 튜플 리스트
         connections = self.mp_pose.POSE_CONNECTIONS
         for connection in connections:
             start_idx, end_idx = connection
-            if (start_idx < len(landmarks_data) and end_idx < len(landmarks_data) and
-                landmarks_data[start_idx].get('visibility', 0) > 0.5 and
-                landmarks_data[end_idx].get('visibility', 0) > 0.5):
+            if (start_idx < len(landmarks_data) and end_idx < len(landmarks_data)):
+                start_vis = landmarks_data[start_idx].get('visibility', 0.0)
+                end_vis = landmarks_data[end_idx].get('visibility', 0.0)
+                # 둘 중 하나라도 visibility가 임계값 이상이면 선 그리기 (더 관대하게)
+                if start_vis > visibility_threshold or end_vis > visibility_threshold:
+                    start_point = (
+                        int(landmarks_data[start_idx]['x'] * w),
+                        int(landmarks_data[start_idx]['y'] * h)
+                    )
+                    end_point = (
+                        int(landmarks_data[end_idx]['x'] * w),
+                        int(landmarks_data[end_idx]['y'] * h)
+                    )
+                    # visibility에 따라 선 색상 강도 조절
+                    avg_vis = (start_vis + end_vis) / 2.0
+                    color_intensity = int(255 * min(1.0, avg_vis))
+                    cv2.line(image, start_point, end_point, (0, color_intensity, 0), 2)
                 
                 start_point = (
                     int(landmarks_data[start_idx]['x'] * w),
@@ -722,6 +767,7 @@ class StereoViewer:
                 results_1 = None
                 
                 # 캘리브레이션 모드일 때는 포즈 추정 사용 안 함
+                # 모션캡쳐 모드에서도 스켈레톤은 계속 그려야 함
                 if self.use_pose_estimation and not self.calibration_mode:
                     # 큐에서 최신 추론 결과 가져오기 (Non-blocking)
                     if self.pose_queue_0 is not None:
@@ -733,7 +779,7 @@ class StereoViewer:
                         
                         if self.latest_pose_result_0 is not None:
                             wrist_y_0 = self.latest_pose_result_0.wrist_y
-                            # 랜드마크 그리기
+                            # 랜드마크 그리기 (모션캡쳐 모드에서도 그리기)
                             if self.latest_pose_result_0.landmarks:
                                 self._draw_landmarks_from_data(frame_0, self.latest_pose_result_0.landmarks)
                     
@@ -746,9 +792,43 @@ class StereoViewer:
                         
                         if self.latest_pose_result_1 is not None:
                             wrist_y_1 = self.latest_pose_result_1.wrist_y
-                            # 랜드마크 그리기
+                            # 랜드마크 그리기 (모션캡쳐 모드에서도 그리기)
                             if self.latest_pose_result_1.landmarks:
                                 self._draw_landmarks_from_data(frame_1, self.latest_pose_result_1.landmarks)
+                
+                # --- 3D 모션캡쳐 처리 (Step 8, 9, 10) ---
+                # 모션캡쳐 모드가 활성화되어 있고, 양쪽 랜드마크가 모두 있을 때만 처리
+                if (self.mocap_enabled and 
+                    self.mocap_3d is not None and 
+                    self.mocap_visualizer is not None):
+                    
+                    # 양쪽 랜드마크 확인
+                    has_landmarks_0 = (self.latest_pose_result_0 is not None and 
+                                      self.latest_pose_result_0.landmarks and 
+                                      len(self.latest_pose_result_0.landmarks) > 0)
+                    has_landmarks_1 = (self.latest_pose_result_1 is not None and 
+                                      self.latest_pose_result_1.landmarks and 
+                                      len(self.latest_pose_result_1.landmarks) > 0)
+                    
+                    if has_landmarks_0 and has_landmarks_1:
+                        try:
+                            # 3D 복원
+                            landmarks_3d, valid_mask = self.mocap_3d.process(
+                                self.latest_pose_result_0.landmarks,
+                                self.latest_pose_result_1.landmarks,
+                                timestamp=time.time()
+                            )
+                            
+                            # 시각화 및 로깅
+                            self.mocap_visualizer.visualize_frame(
+                                landmarks_3d,
+                                valid_mask,
+                                timestamp=time.time()
+                            )
+                        except Exception as e:
+                            self.logger.error(f"3D 모션캡쳐 처리 오류: {e}")
+                            import traceback
+                            traceback.print_exc()
                 
                 # --- 캘리브레이션 모드 ---
                 calibration_ready = False
@@ -977,6 +1057,32 @@ class StereoViewer:
                             self.logger.info("자동 캡쳐 모드 종료")
                     else:
                         self.logger.warning("자동 캡쳐는 캘리브레이션 모드에서만 사용 가능합니다. 'c' 키로 캘리브레이션 모드를 먼저 활성화하세요.")
+                
+                elif key == ord('m'): # 모션캡쳐 모드 토글
+                    if self.calib_data is None:
+                        self.logger.warning("모션캡쳐를 사용하려면 먼저 캘리브레이션을 완료해야 합니다.")
+                    else:
+                        self.mocap_enabled = not self.mocap_enabled
+                        if self.mocap_enabled:
+                            # 모션캡쳐 초기화 (캘리브레이션 데이터가 로드된 경우)
+                            if self.mocap_3d is None:
+                                try:
+                                    self.mocap_3d = MotionCapture3D(
+                                        calibration_data=self.calib_data,
+                                        confidence_threshold=0.6,
+                                        use_midpoint=True,
+                                        filter_enabled=True
+                                    )
+                                    self.mocap_visualizer = MotionCaptureVisualizer(
+                                        export_csv=True,
+                                        csv_path="output/mocap_data.csv",
+                                        use_matplotlib=True
+                                    )
+                                    self.logger.info("3D 모션캡쳐 시스템 초기화 완료")
+                                except Exception as e:
+                                    self.logger.error(f"3D 모션캡쳐 초기화 실패: {e}")
+                                    self.mocap_enabled = False
+                        self.logger.info(f"3D 모션캡쳐 모드 {'시작' if self.mocap_enabled else '종료'}")
                     
                 elif key == ord(' '):
                     if self.calibration_mode:
@@ -1067,6 +1173,13 @@ class StereoViewer:
         """정리 작업"""
         self.running = False
         self.stop_recording()
+        
+        # 모션캡쳐 시각화 정리
+        if self.mocap_visualizer is not None:
+            try:
+                self.mocap_visualizer.close()
+            except Exception as e:
+                self.logger.error(f"모션캡쳐 시각화 정리 오류: {e}")
         
         # 포즈 추론 프로세스는 외부에서 관리되므로 여기서는 정리하지 않음
         

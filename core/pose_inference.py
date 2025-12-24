@@ -21,6 +21,7 @@ from core.shared_buffer import SharedRingBuffer
 from model.pose_detector import PoseDetector
 from utils.logger import get_logger
 from utils.camera_config import load_config
+from motion_capture.roi_tracker import ROITracker
 
 
 @dataclass
@@ -111,6 +112,22 @@ class PoseInferenceProcess:
             self.logger.info(f"포즈 감지기 초기화 완료 (카메라 {self.camera_index})")
         else:
             self.detector = None
+        
+        # ROI Tracker 초기화 (Step 7)
+        # config에서 roi_tracking_enabled 또는 use_roi_tracking 확인 (기본값: False로 변경하여 문제 방지)
+        pose_config = self.config.get('pose_estimation', {}) if self.config else {}
+        self.use_roi_tracking = pose_config.get('roi_tracking_enabled', pose_config.get('use_roi_tracking', False))
+        self.roi_tracker = None
+        if self.use_roi_tracking:
+            self.roi_tracker = ROITracker(
+                margin_ratio=0.2,
+                decay_factor=0.9,
+                min_roi_size=(100, 100)
+            )
+            self.logger.info(f"ROI Tracking 활성화 (카메라 {self.camera_index})")
+        else:
+            self.logger.info(f"ROI Tracking 비활성화 (카메라 {self.camera_index})")
+        self.confidence_threshold = self.config.get('pose_estimation', {}).get('confidence_threshold', 0.6) if self.config else 0.6
     
     def _extract_wrist_y(self, results) -> Optional[float]:
         """MediaPipe 결과에서 오른쪽 손목 Y좌표 추출"""
@@ -149,20 +166,60 @@ class PoseInferenceProcess:
                 # 포즈 추론 수행
                 landmarks_data = None
                 if self.use_pose_estimation and self.detector is not None:
-                    results = self.detector.process(frame)
+                    # ROI Tracking 적용 (Step 7)
+                    roi = None
+                    if self.use_roi_tracking and self.roi_tracker is not None:
+                        roi = self.roi_tracker.get_roi()
+                    
+                    # ROI가 있으면 해당 영역만 처리
+                    if roi is not None:
+                        x, y, w, h = roi
+                        # ROI가 이미지 범위를 벗어나지 않도록 체크
+                        x = max(0, min(x, frame.shape[1] - 1))
+                        y = max(0, min(y, frame.shape[0] - 1))
+                        w = min(w, frame.shape[1] - x)
+                        h = min(h, frame.shape[0] - y)
+                        
+                        if w > 0 and h > 0:
+                            roi_frame = frame[y:y+h, x:x+w]
+                            if roi_frame.size > 0 and roi_frame.shape[0] > 0 and roi_frame.shape[1] > 0:
+                                results = self.detector.process(roi_frame)
+                                # ROI 좌표를 전체 이미지 좌표로 변환
+                                if results and results.pose_landmarks:
+                                    import mediapipe as mp_lib
+                                    for landmark in results.pose_landmarks.landmark:
+                                        # ROI 내 정규화된 좌표를 전체 이미지 정규화 좌표로 변환
+                                        landmark.x = (landmark.x * w + x) / frame.shape[1]
+                                        landmark.y = (landmark.y * h + y) / frame.shape[0]
+                            else:
+                                # ROI 프레임이 유효하지 않으면 전체 프레임 사용
+                                results = self.detector.process(frame)
+                        else:
+                            # ROI가 유효하지 않으면 전체 프레임 사용
+                            results = self.detector.process(frame)
+                    else:
+                        results = self.detector.process(frame)
+                    
                     wrist_y = self._extract_wrist_y(results)
                     ready_pose = self._is_ready_pose(results)
                     
                     # 랜드마크 정보를 직렬화 가능한 형태로 변환
+                    # 주의: 3D 복원과 스켈레톤 그리기를 위해 모든 랜드마크를 포함해야 함
+                    # visibility는 원본 값을 유지하고, 3D 복원 시에만 confidence_threshold로 필터링
                     if results and results.pose_landmarks:
                         landmarks_data = []
                         for landmark in results.pose_landmarks.landmark:
+                            # 모든 랜드마크를 포함 (visibility는 원본 값 유지)
                             landmarks_data.append({
                                 'x': landmark.x,
                                 'y': landmark.y,
                                 'z': landmark.z,
-                                'visibility': landmark.visibility
+                                'visibility': landmark.visibility  # 원본 visibility 유지
                             })
+                    
+                    # ROI 업데이트 (landmarks_data가 None이 아닐 때만)
+                    if self.use_roi_tracking:
+                        self.roi_tracker.update(landmarks_data, frame.shape)
                 else:
                     wrist_y = None
                     ready_pose = False

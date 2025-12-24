@@ -78,6 +78,17 @@ pose_estimation:
     min_detection_confidence: 0.5
     min_tracking_confidence: 0.5
     enable_segmentation: false
+  
+  # Step 7: 2D Pose Estimation 최적화
+  use_roi_tracking: true  # ROI Tracking 활성화
+  confidence_threshold: 0.6  # 신뢰도 임계값 (0.6 미만 제외)
+  
+  # Step 9: 필터 설정
+  filter:
+    enabled: true
+    min_cutoff: 1.0  # 최소 차단 주파수
+    beta: 0.5  # 속도 감쇠 계수
+    d_cutoff: 1.0  # 속도 필터 차단 주파수
     
   # RTMPose 설정 (사용 시)
   rtmpose:

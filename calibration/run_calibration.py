@@ -267,7 +267,7 @@ def run_calibration(
     output_file: str = "calibration_result.yaml",
     square_size: float = 30.0,
     chessboard_size: tuple = (8, 5),  # (가로 내부 코너 수, 세로 내부 코너 수)
-    mode: str = "extrinsic"  # "combined", "intrinsic", "extrinsic"
+    mode: str = "combined"  # "combined", "intrinsic", "extrinsic"
 ):
     """
     스테레오 캘리브레이션 실행 (통합 또는 분리 모드)
@@ -312,6 +312,11 @@ def run_calibration(
         image_size = None
         
         print("\n[이미지 처리 중...]")
+        
+        # 커버리지 확인용 이미지 (나중에 초기화)
+        coverage_l = None
+        coverage_r = None
+        
         for left_img_path, right_img_path in zip(left_images, right_images):
             img_l = cv2.imread(left_img_path)
             img_r = cv2.imread(right_img_path)
@@ -321,14 +326,28 @@ def run_calibration(
                 
             if image_size is None:
                 image_size = (img_l.shape[1], img_l.shape[0])
+                # 이미지 크기가 결정되면 커버리지 맵 초기화
+                coverage_l = np.zeros((image_size[1], image_size[0], 3), dtype=np.uint8)
+                coverage_r = np.zeros((image_size[1], image_size[0], 3), dtype=np.uint8)
                 
             gray_l = cv2.cvtColor(img_l, cv2.COLOR_BGR2GRAY)
             gray_r = cv2.cvtColor(img_r, cv2.COLOR_BGR2GRAY)
+            
+            # 흔들림(Blur) 체크 - Laplacian Variance
+            # 값이 작을수록 흐릿함. 일반적으로 100 미만이면 흐릿하다고 판단하지만
+            # 환경에 따라 다르므로 여기서는 로그만 출력하고 낮은 경우 경고
+            blur_l = cv2.Laplacian(gray_l, cv2.CV_64F).var()
+            blur_r = cv2.Laplacian(gray_r, cv2.CV_64F).var()
             
             # 체스보드 찾기
             flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
             ret_l, corners_l = cv2.findChessboardCorners(gray_l, chessboard_size, flags)
             ret_r, corners_r = cv2.findChessboardCorners(gray_r, chessboard_size, flags)
+            
+            is_blurry = blur_l < 50 or blur_r < 50 # 임계값 설정 (조절 가능)
+            blur_msg = f" (Blur: L={blur_l:.1f}, R={blur_r:.1f})" if is_blurry else ""
+            if is_blurry:
+                print(f"  - [Warning] 흔들림 의심: {os.path.basename(left_img_path)}{blur_msg}")
             
             if ret_l and ret_r:
                 # 정밀도 향상 (Subpixel)
@@ -336,13 +355,46 @@ def run_calibration(
                 corners_l = cv2.cornerSubPix(gray_l, corners_l, (11, 11), (-1, -1), criteria)
                 corners_r = cv2.cornerSubPix(gray_r, corners_r, (11, 11), (-1, -1), criteria)
                 
+                # [디버그] 감지된 코너 그리기 및 저장
+                debug_dir = os.path.join(image_dir, "debug")
+                os.makedirs(debug_dir, exist_ok=True)
+                
+                vis_l = img_l.copy()
+                vis_r = img_r.copy()
+                cv2.drawChessboardCorners(vis_l, chessboard_size, corners_l, ret_l)
+                cv2.drawChessboardCorners(vis_r, chessboard_size, corners_r, ret_r)
+                
+                # 커버리지 맵에 그리기 (흰색 점)
+                if coverage_l is not None:
+                    cv2.drawChessboardCorners(coverage_l, chessboard_size, corners_l, ret_l)
+                if coverage_r is not None:
+                    cv2.drawChessboardCorners(coverage_r, chessboard_size, corners_r, ret_r)
+                
+                # 시작점(0번 코너)에 빨간색 큰 원 그리기
+                if len(corners_l) > 0:
+                    cv2.circle(vis_l, tuple(map(int, corners_l[0][0])), 15, (0, 0, 255), -1)
+                if len(corners_r) > 0:
+                    cv2.circle(vis_r, tuple(map(int, corners_r[0][0])), 15, (0, 0, 255), -1)
+                
+                vis_concat = np.hstack([vis_l, vis_r])
+                cv2.imwrite(os.path.join(debug_dir, f"vis_{os.path.basename(left_img_path)}"), vis_concat)
+                
                 objpoints.append(objp)
                 imgpoints_l.append(corners_l)
                 imgpoints_r.append(corners_r)
                 valid_pairs += 1
-                print(f"  - OK: {os.path.basename(left_img_path)}")
+                print(f"  - OK: {os.path.basename(left_img_path)}{blur_msg}")
             else:
                 print(f"  - Skip (감지 실패): {os.path.basename(left_img_path)}")
+        
+        # 커버리지 이미지 저장
+        if coverage_l is not None:
+            cv2.imwrite(os.path.join(image_dir, "coverage_left.jpg"), coverage_l)
+        if coverage_r is not None:
+            cv2.imwrite(os.path.join(image_dir, "coverage_right.jpg"), coverage_r)
+        
+        if coverage_l is not None:
+             print(f"\n[정보] 커버리지 맵 저장됨: coverage_left.jpg, coverage_right.jpg (화면을 골고루 덮었는지 확인하세요)")
                 
         print(f"\n총 {len(left_images)}장 중 {valid_pairs}장 유효함.")
         
@@ -364,7 +416,9 @@ def run_calibration(
         
         # --- 2. 스테레오 캘리브레이션 (Extrinsic) ---
         print("\n[스테레오 캘리브레이션 수행 중...]")
-        flags = cv2.CALIB_FIX_INTRINSIC
+        # Intrinsic 파라미터를 초기값으로 사용하되, 스테레오 캘리브레이션 과정에서 미세 조정 허용
+        # Reprojection Error가 매우 클 때 유용함
+        flags = cv2.CALIB_USE_INTRINSIC_GUESS
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-5)
         
         ret_stereo, mtx_l, dist_l, mtx_r, dist_r, R, T, E, F = cv2.stereoCalibrate(
@@ -378,6 +432,11 @@ def run_calibration(
         
         print(f"  - Stereo Reprojection Error: {ret_stereo:.4f}")
         print(f"  - Translation Vector (T):\n{T}")
+        
+        if ret_stereo > 1.0:
+            print("\n[경고] Reprojection Error가 1.0보다 큽니다. 캘리브레이션 품질이 낮습니다.")
+            print("  - 체스보드 촬영 각도를 다양하게 하여 재촬영하거나,")
+            print("  - 흔들린 이미지를 제거하고 다시 시도하세요.")
         
         # --- 3. 결과 저장 ---
         # Numpy array는 yaml로 바로 저장이 안되므로 리스트로 변환
@@ -454,4 +513,3 @@ if __name__ == "__main__":
         chessboard_size=(args.cols, args.rows),
         mode=args.mode
     )
-
