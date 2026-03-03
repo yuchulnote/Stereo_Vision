@@ -27,7 +27,7 @@ import camera_test  # 카메라 선택 함수 사용
 class StereoVisionSystem:
     """스테레오 비전 시스템 메인 클래스"""
     
-    def __init__(self, config_path: str = "config.yaml", camera_0_index: Optional[int] = None, camera_1_index: Optional[int] = None):
+    def __init__(self, config_path: str = str(project_root / "config.yaml"), camera_0_index: Optional[int] = None, camera_1_index: Optional[int] = None):
         """
         Args:
             config_path: 설정 파일 경로
@@ -548,7 +548,7 @@ def main():
     parser.add_argument(
         '--config',
         type=str,
-        default='config.yaml',
+        default=str(project_root / 'config.yaml'),
         help='설정 파일 경로'
     )
     parser.add_argument(
