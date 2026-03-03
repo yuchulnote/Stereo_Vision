@@ -23,6 +23,9 @@ from enum import Enum
 import cv2
 import numpy as np
 
+# PyTorch를 onnxruntime보다 먼저 import (Windows cuDNN DLL 충돌 방지)
+import torch  # noqa: F401 — must be before rtmlib/onnxruntime
+
 # ==================== 경로 설정 ====================
 STEREO_ROOT = Path(__file__).parent
 sys.path.insert(0, str(STEREO_ROOT))
@@ -44,6 +47,25 @@ from motion_capture.visualizer import MotionCaptureVisualizer
 from person_tracker import TrackedPerson
 from single_camera_tracker import SingleCameraTracker, LocalTrack
 from global_identity_manager import GlobalIdentityManager
+
+
+class StereoGlobalIdentityManager(GlobalIdentityManager):
+    """Stereo 전용 GlobalIdentityManager.
+
+    원본은 비겹침 카메라(CCTV) 설계로, "동시 존재 배제" 로직이 있음:
+    같은 사람이 두 카메라에 동시에 보이면 → 다른 사람으로 판단 → 매칭 차단.
+
+    Stereo 환경에서는 같은 사람이 두 카메라에 **반드시** 동시에 보이므로
+    이 로직을 비활성화한다. _frame_active_gids를 항상 빈 dict로 유지.
+    """
+
+    @property
+    def _frame_active_gids(self):
+        return {}
+
+    @_frame_active_gids.setter
+    def _frame_active_gids(self, value):
+        pass  # 무시 — 동시 존재 배제 비활성화
 
 
 # ==================== COCO 17 → MediaPipe 33 변환 ====================
@@ -122,34 +144,6 @@ def compute_bbox(keypoints, scores, frame_shape, threshold=0.5, padding=20):
     if x_max - x_min < 10 or y_max - y_min < 10:
         return None
     return (x_min, y_min, x_max - x_min, y_max - y_min)
-
-
-def match_persons_reid(features_0, features_1, threshold=0.4):
-    """Re-ID 피처로 크로스-카메라 매칭 (Hungarian algorithm).
-
-    Returns:
-        List[(idx_cam0, idx_cam1)] 매칭된 인덱스 쌍
-    """
-    if not features_0 or not features_1:
-        return []
-
-    feat_0 = np.array(features_0)  # (N, 512)
-    feat_1 = np.array(features_1)  # (M, 512)
-
-    # cosine similarity (L2 정규화 → dot product = cosine sim)
-    sim_matrix = feat_0 @ feat_1.T
-    cost_matrix = 1.0 - sim_matrix
-
-    from scipy.optimize import linear_sum_assignment
-    rows, cols = linear_sum_assignment(cost_matrix)
-
-    matches = []
-    for r, c in zip(rows, cols):
-        if sim_matrix[r, c] >= threshold:
-            matches.append((int(r), int(c)))
-
-    return matches
-
 
 # ==================== Drawing ====================
 
@@ -258,7 +252,7 @@ class StereoAutoCalibApp:
         height: int = 480,
         device: str = "cuda",
         rtmpose_mode: str = "balanced",
-        reid_model: str = "osnet_ain_x0_25",
+        reid_model: str = "osnet_ain_x1_0",
         load_calibration: str = None,
     ):
         self.width = width
@@ -298,6 +292,20 @@ class StereoAutoCalibApp:
             print(f"[INFO] Re-ID 초기화 완료: {reid_model}")
         except Exception as e:
             print(f"[WARN] Re-ID 초기화 실패 (1명 모드로 동작): {e}")
+
+        # ── Per-camera trackers (Kalman + IoU + Re-ID cascade) ──
+        self.tracker0 = SingleCameraTracker(
+            camera_id=0, frame_width=width, frame_height=height,
+        )
+        self.tracker1 = SingleCameraTracker(
+            camera_id=1, frame_width=width, frame_height=height,
+        )
+
+        # ── Cross-camera global ID manager (stereo 전용: 동시 존재 허용) ──
+        self.global_manager = StereoGlobalIdentityManager(
+            coord_transformer=None,  # homography 미사용
+        )
+        self._frame_idx = 0
 
         # ── Auto Calibrator ──
         self.calibrator = AutoCalibrator(self.image_size)
@@ -394,46 +402,51 @@ class StereoAutoCalibApp:
 
     def _process_calibrating(self, frame0, frame1):
         # ── 포즈 검출 ──
-        persons0, bboxes0 = self._detect_persons(frame0)
-        persons1, bboxes1 = self._detect_persons(frame1)
+        detections0 = self._detect_persons(frame0)
+        detections1 = self._detect_persons(frame1)
 
-        # ── Re-ID 크로스-카메라 매칭 ──
+        # ── Overlord 풀 파이프라인 매칭 ──
         matches = self._match_across_cameras(
-            frame0, frame1, persons0, bboxes0, persons1, bboxes1,
+            frame0, frame1, detections0, detections1,
         )
 
         # ── 대응점 수집 + 시각화 ──
         vis0, vis1 = frame0.copy(), frame1.copy()
 
-        for match_idx, (i0, i1) in enumerate(matches):
+        matched_tids_0 = set()
+        matched_tids_1 = set()
+
+        for match_idx, (track0, track1, gid) in enumerate(matches):
             color = self.MATCH_COLORS[match_idx % len(self.MATCH_COLORS)]
-            p0, p1 = persons0[i0], persons1[i1]
+            matched_tids_0.add(track0.track_id)
+            matched_tids_1.add(track1.track_id)
 
             self.calibrator.add_correspondences(
-                p0['keypoints'], p0['scores'],
-                p1['keypoints'], p1['scores'],
+                track0.keypoints, track0.scores,
+                track1.keypoints, track1.scores,
             )
 
-            draw_skeleton(vis0, p0['keypoints'], p0['scores'], color)
-            draw_skeleton(vis1, p1['keypoints'], p1['scores'], color)
+            draw_skeleton(vis0, track0.keypoints, track0.scores, color)
+            draw_skeleton(vis1, track1.keypoints, track1.scores, color)
 
-            # 매칭 번호
-            bx0, by0 = int(p0['bbox'][0] + p0['bbox'][2] / 2) - 30, p0['bbox'][1] - 10
-            bx1, by1 = int(p1['bbox'][0] + p1['bbox'][2] / 2) - 30, p1['bbox'][1] - 10
-            cv2.putText(vis0, f"Match#{match_idx+1}", (bx0, by0),
+            # 매칭 ID 표시
+            label = f"GID#{gid}"
+            bx0 = int(track0.bbox[0] + track0.bbox[2] / 2) - 20
+            by0 = track0.bbox[1] - 10
+            bx1 = int(track1.bbox[0] + track1.bbox[2] / 2) - 20
+            by1 = track1.bbox[1] - 10
+            cv2.putText(vis0, label, (bx0, by0),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            cv2.putText(vis1, f"Match#{match_idx+1}", (bx1, by1),
+            cv2.putText(vis1, label, (bx1, by1),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # 매칭 안 된 사람 (회색)
-        matched_0 = {m[0] for m in matches}
-        matched_1 = {m[1] for m in matches}
-        for i, p in enumerate(persons0):
-            if i not in matched_0:
-                draw_skeleton(vis0, p['keypoints'], p['scores'], self.GRAY)
-        for i, p in enumerate(persons1):
-            if i not in matched_1:
-                draw_skeleton(vis1, p['keypoints'], p['scores'], self.GRAY)
+        # 매칭 안 된 active tracks (회색)
+        for t in self.tracker0.get_active_tracks():
+            if t.track_id not in matched_tids_0:
+                draw_skeleton(vis0, t.keypoints, t.scores, self.GRAY)
+        for t in self.tracker1.get_active_tracks():
+            if t.track_id not in matched_tids_1:
+                draw_skeleton(vis1, t.keypoints, t.scores, self.GRAY)
 
         # ── 합성 + 오버레이 ──
         display = np.hstack([vis0, vis1])
@@ -477,27 +490,30 @@ class StereoAutoCalibApp:
     # ==================================================================
 
     def _process_3d(self, frame0, frame1):
-        persons0, bboxes0 = self._detect_persons(frame0)
-        persons1, bboxes1 = self._detect_persons(frame1)
+        detections0 = self._detect_persons(frame0)
+        detections1 = self._detect_persons(frame1)
 
         matches = self._match_across_cameras(
-            frame0, frame1, persons0, bboxes0, persons1, bboxes1,
+            frame0, frame1, detections0, detections1,
         )
 
         vis0, vis1 = frame0.copy(), frame1.copy()
         valid_count = 0
+        matched_tids_0 = set()
+        matched_tids_1 = set()
 
         # 첫 번째 매칭 쌍으로 3D 재구성
         if matches and self.mocap:
-            i0, i1 = matches[0]
-            p0, p1 = persons0[i0], persons1[i1]
+            track0, track1, gid = matches[0]
+            matched_tids_0.add(track0.track_id)
+            matched_tids_1.add(track1.track_id)
 
             # COCO 17 → MediaPipe 33 변환 (정규화 좌표)
             lm0 = coco_to_mediapipe_landmarks(
-                p0['keypoints'], p0['scores'], self.image_size,
+                track0.keypoints, track0.scores, self.image_size,
             )
             lm1 = coco_to_mediapipe_landmarks(
-                p1['keypoints'], p1['scores'], self.image_size,
+                track1.keypoints, track1.scores, self.image_size,
             )
 
             landmarks_3d, valid_mask = self.mocap.process(lm0, lm1)
@@ -507,18 +523,24 @@ class StereoAutoCalibApp:
                 self.visualizer.visualize_frame(landmarks_3d, valid_mask)
 
             # 메인 매칭 스켈레톤 (녹색)
-            draw_skeleton(vis0, p0['keypoints'], p0['scores'], (0, 255, 0))
-            draw_skeleton(vis1, p1['keypoints'], p1['scores'], (0, 255, 0))
+            draw_skeleton(vis0, track0.keypoints, track0.scores, (0, 255, 0))
+            draw_skeleton(vis1, track1.keypoints, track1.scores, (0, 255, 0))
 
-        # 나머지 사람 (회색)
-        matched_0 = {m[0] for m in matches}
-        matched_1 = {m[1] for m in matches}
-        for i, p in enumerate(persons0):
-            if i not in matched_0:
-                draw_skeleton(vis0, p['keypoints'], p['scores'], self.GRAY)
-        for i, p in enumerate(persons1):
-            if i not in matched_1:
-                draw_skeleton(vis1, p['keypoints'], p['scores'], self.GRAY)
+        # 나머지 매칭 쌍 (다른 색)
+        for match_idx, (t0, t1, gid) in enumerate(matches[1:], start=1):
+            color = self.MATCH_COLORS[match_idx % len(self.MATCH_COLORS)]
+            matched_tids_0.add(t0.track_id)
+            matched_tids_1.add(t1.track_id)
+            draw_skeleton(vis0, t0.keypoints, t0.scores, color)
+            draw_skeleton(vis1, t1.keypoints, t1.scores, color)
+
+        # 매칭 안 된 사람 (회색)
+        for t in self.tracker0.get_active_tracks():
+            if t.track_id not in matched_tids_0:
+                draw_skeleton(vis0, t.keypoints, t.scores, self.GRAY)
+        for t in self.tracker1.get_active_tracks():
+            if t.track_id not in matched_tids_1:
+                draw_skeleton(vis1, t.keypoints, t.scores, self.GRAY)
 
         display = np.hstack([vis0, vis1])
 
@@ -537,44 +559,250 @@ class StereoAutoCalibApp:
     # 공통 메서드
     # ==================================================================
 
+    # config와 동일한 검출 임계값 (multi_camera_system과 통일)
+    _MIN_VALID_KEYPOINTS = 10
+    _KPT_NMS_DIST_THRESH = 15
+    _KPT_NMS_MIN_SHARED = 5
+
     def _detect_persons(self, frame):
-        """RTMPose로 프레임에서 사람 검출.
+        """RTMPose로 프레임에서 사람 검출 + Keypoint NMS.
+
+        multi_camera_system.py의 detect() + _keypoint_nms()와 동일 로직.
 
         Returns:
-            (persons, bboxes) — persons: list[dict], bboxes: list[tuple]
+            list[TrackedPerson] — Overlord 호환 detection 리스트
         """
         kpts_all, scores_all = self.body(frame)
 
-        persons = []
-        bboxes = []
+        detections = []
         for kpts, scrs in zip(kpts_all, scores_all):
             valid = scrs > 0.5
-            if valid.sum() < 5:
+            if valid.sum() < self._MIN_VALID_KEYPOINTS:
                 continue
             bbox = compute_bbox(kpts, scrs, frame.shape)
             if bbox is None:
                 continue
-            persons.append({'keypoints': kpts, 'scores': scrs, 'bbox': bbox})
-            bboxes.append(bbox)
+            cx = bbox[0] + bbox[2] // 2
+            cy = bbox[1] + bbox[3] // 2
+            avg_conf = float(scrs[scrs > 0.5].mean()) if (scrs > 0.5).any() else 0.0
+            detections.append(TrackedPerson(
+                bbox=bbox,
+                center=(cx, cy),
+                keypoints=kpts,
+                scores=scrs,
+                confidence=avg_conf,
+            ))
 
-        return persons, bboxes
+        # Keypoint NMS: 동일 인물의 중복 검출 제거
+        return self._keypoint_nms(detections)
+
+    @staticmethod
+    def _keypoint_nms(detections):
+        """같은 index keypoint가 가까운 detection 쌍 → confidence 낮은 쪽 제거."""
+        if len(detections) <= 1:
+            return detections
+        keep = [True] * len(detections)
+        dist_thresh = StereoAutoCalibApp._KPT_NMS_DIST_THRESH
+        min_shared = StereoAutoCalibApp._KPT_NMS_MIN_SHARED
+        for i in range(len(detections)):
+            if not keep[i]:
+                continue
+            for j in range(i + 1, len(detections)):
+                if not keep[j]:
+                    continue
+                kpts_i, kpts_j = detections[i].keypoints, detections[j].keypoints
+                scrs_i, scrs_j = detections[i].scores, detections[j].scores
+                shared_close = 0
+                for k in range(len(kpts_i)):
+                    if scrs_i[k] < 0.5 or scrs_j[k] < 0.5:
+                        continue
+                    if np.linalg.norm(kpts_i[k] - kpts_j[k]) < dist_thresh:
+                        shared_close += 1
+                if shared_close >= min_shared:
+                    if detections[i].confidence < detections[j].confidence:
+                        keep[i] = False
+                    else:
+                        keep[j] = False
+        return [d for d, k in zip(detections, keep) if k]
 
     def _match_across_cameras(self, frame0, frame1,
-                               persons0, bboxes0, persons1, bboxes1):
-        """크로스-카메라 매칭. Re-ID 없으면 1명 전용."""
-        if not persons0 or not persons1:
-            return []
+                               detections0, detections1):
+        """Overlord 풀 파이프라인으로 크로스-카메라 매칭.
+
+        multi_camera_system.py와 동일한 파이프라인:
+        색상 히스토그램 → 겹침 마스킹 크롭 → Re-ID →
+        SingleCameraTracker → GlobalIdentityManager → 같은 GID 쌍 찾기.
+
+        Returns:
+            List[(LocalTrack, LocalTrack, int)] — (cam0 track, cam1 track, global_id)
+        """
+        self._frame_idx += 1
+        all_dets = {0: detections0, 1: detections1}
+        frames = {0: frame0, 1: frame1}
+        trackers = {0: self.tracker0, 1: self.tracker1}
+
+        # ── 색상 히스토그램 계산 (보조 매칭 신호) ──
+        for cam_id, dets in all_dets.items():
+            f = frames[cam_id]
+            fh, fw = f.shape[:2]
+            for det in dets:
+                x, y, w, h = det.bbox
+                x1, y1 = max(0, x), max(0, y)
+                x2, y2 = min(fw, x + w), min(fh, y + h)
+                if x2 > x1 and y2 > y1:
+                    det.color_histogram = self._compute_color_histogram(
+                        f[y1:y2, x1:x2])
+
+        # ── 스켈레톤 기반 크롭 + 겹침 마스킹 + Re-ID 추출 ──
+        all_crops = []
+        crop_map = []  # (cam_id, det_idx)
+        all_features = {0: [None] * len(detections0),
+                        1: [None] * len(detections1)}
 
         if self.reid:
-            features0 = self.reid.extract(frame0, bboxes0)
-            features1 = self.reid.extract(frame1, bboxes1)
-            return match_persons_reid(features0, features1)
+            for cam_id, dets in all_dets.items():
+                for det_idx, det in enumerate(dets):
+                    other_bboxes = [d.bbox for j, d in enumerate(dets) if j != det_idx]
+                    crop = self._get_reid_crop_masked(
+                        frames[cam_id], det, other_bboxes)
+                    if crop is not None:
+                        all_crops.append(crop)
+                        crop_map.append((cam_id, det_idx))
 
-        # Re-ID 없으면: 양쪽 1명씩일 때만 매칭
-        if len(persons0) == 1 and len(persons1) == 1:
-            return [(0, 0)]
+            if all_crops:
+                extracted = self.reid.extract_from_crops(all_crops)
+                for i, (cam_id, det_idx) in enumerate(crop_map):
+                    all_features[cam_id][det_idx] = extracted[i]
 
-        return []
+        # None → zero vector fallback
+        for cam_id in (0, 1):
+            for i in range(len(all_features[cam_id])):
+                if all_features[cam_id][i] is None:
+                    all_features[cam_id][i] = np.zeros(512, dtype=np.float32)
+
+        # ── Per-camera tracking (Kalman + IoU + Re-ID cascade) ──
+        for cam_id in (0, 1):
+            trackers[cam_id].prune_lost_tracks(30.0)
+        active0 = self.tracker0.update(detections0, all_features[0])
+        active1 = self.tracker1.update(detections1, all_features[1])
+
+        # ── Cross-camera global ID matching ──
+        global_mapping = self.global_manager.update(
+            camera_tracks={0: active0, 1: active1},
+            camera_lost_tracks={
+                0: self.tracker0.get_lost_tracks(),
+                1: self.tracker1.get_lost_tracks(),
+            },
+            camera_all_tracks={
+                0: self.tracker0.get_all_tracks(),
+                1: self.tracker1.get_all_tracks(),
+            },
+        )
+
+        # ── 빈 장면 감지 → 전체 상태 초기화 ──
+        all_empty = (len(self.tracker0.tracks) == 0
+                     and len(self.tracker1.tracks) == 0)
+        has_state = bool(
+            self.global_manager.identities
+            or self.global_manager.lost_identities
+            or self.global_manager._track_to_global)
+        if all_empty and has_state:
+            self.tracker0.reset()
+            self.tracker1.reset()
+            self.global_manager.reset()
+
+        # ── 같은 global_id를 가진 (cam0, cam1) 쌍 찾기 ──
+        gid_to_tracks = {}
+        track_map0 = {t.track_id: t for t in active0}
+        track_map1 = {t.track_id: t for t in active1}
+
+        for (cam_id, tid), gid in global_mapping.items():
+            if gid not in gid_to_tracks:
+                gid_to_tracks[gid] = {}
+            if cam_id == 0 and tid in track_map0:
+                gid_to_tracks[gid][0] = track_map0[tid]
+            elif cam_id == 1 and tid in track_map1:
+                gid_to_tracks[gid][1] = track_map1[tid]
+
+        matches = []
+        for gid, cam_tracks in gid_to_tracks.items():
+            if 0 in cam_tracks and 1 in cam_tracks:
+                matches.append((cam_tracks[0], cam_tracks[1], gid))
+
+        return matches
+
+    # ==================================================================
+    # Re-ID 크롭 헬퍼 (multi_camera_system.py에서 이식)
+    # ==================================================================
+
+    @staticmethod
+    def _compute_color_histogram(crop):
+        """HSV 색상 히스토그램 (딥러닝 독립 보조 식별 특징)"""
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 16], [0, 180, 0, 256])
+        hist = cv2.normalize(hist, hist).flatten()
+        return hist
+
+    @staticmethod
+    def _crop_body_from_keypoints(frame, keypoints, scores, padding_ratio=0.1):
+        """스켈레톤 기반 정밀 크롭 (배경 노이즈 최소화)"""
+        h, w = frame.shape[:2]
+        valid = scores > 0.3
+        if valid.sum() < 4:
+            return None
+        valid_pts = keypoints[valid]
+        min_x, max_x = valid_pts[:, 0].min(), valid_pts[:, 0].max()
+        min_y, max_y = valid_pts[:, 1].min(), valid_pts[:, 1].max()
+        pw = (max_x - min_x) * padding_ratio
+        ph = (max_y - min_y) * padding_ratio
+        x1 = int(max(0, min_x - pw))
+        y1 = int(max(0, min_y - ph))
+        x2 = int(min(w, max_x + pw))
+        y2 = int(min(h, max_y + ph))
+        crop = frame[y1:y2, x1:x2]
+        return crop if crop.size > 0 else None
+
+    def _get_reid_crop(self, frame, detection):
+        """스켈레톤 기반 크롭. Fallback: bbox 크롭."""
+        crop = None
+        if detection.keypoints is not None and detection.scores is not None:
+            crop = self._crop_body_from_keypoints(
+                frame, detection.keypoints, detection.scores)
+        if crop is None:
+            x, y, bw, bh = detection.bbox
+            fh, fw = frame.shape[:2]
+            x1, y1 = max(0, x), max(0, y)
+            x2, y2 = min(fw, x + bw), min(fh, y + bh)
+            if x2 > x1 and y2 > y1:
+                crop = frame[y1:y2, x1:x2]
+        return crop
+
+    def _get_reid_crop_masked(self, frame, detection, other_bboxes):
+        """다른 사람의 bbox 영역을 마스킹한 후 Re-ID 크롭 추출 (크롭 오염 방지)"""
+        if not other_bboxes:
+            return self._get_reid_crop(frame, detection)
+
+        dx, dy, dw, dh = detection.bbox
+        overlapping = []
+        for bbox in other_bboxes:
+            ox, oy, ow, oh = bbox
+            if (dx < ox + ow and dx + dw > ox and dy < oy + oh and dy + dh > oy):
+                overlapping.append(bbox)
+
+        if not overlapping:
+            return self._get_reid_crop(frame, detection)
+
+        # 겹치는 영역을 ImageNet 평균색으로 마스킹 (모델 중립 활성화)
+        masked_frame = frame.copy()
+        fh, fw = frame.shape[:2]
+        imagenet_mean_bgr = (104, 116, 124)
+        for ox, oy, ow, oh in overlapping:
+            mx1, my1 = max(0, ox), max(0, oy)
+            mx2, my2 = min(fw, ox + ow), min(fh, oy + oh)
+            if mx2 > mx1 and my2 > my1:
+                masked_frame[my1:my2, mx1:mx2] = imagenet_mean_bgr
+
+        return self._get_reid_crop(masked_frame, detection)
 
     def _init_3d_pipeline(self):
         """캘리브레이션 결과로 3D 파이프라인 초기화"""
@@ -642,6 +870,19 @@ class StereoAutoCalibApp:
         if self.visualizer:
             self.visualizer.close()
             self.visualizer = None
+        # 트래커/매니저 초기화
+        self.tracker0 = SingleCameraTracker(
+            camera_id=0,
+            frame_width=self.width,
+            frame_height=self.height,
+        )
+        self.tracker1 = SingleCameraTracker(
+            camera_id=1,
+            frame_width=self.width,
+            frame_height=self.height,
+        )
+        self.global_manager = StereoGlobalIdentityManager(coord_transformer=None)
+        self._frame_idx = 0
         self.state = State.CALIBRATING
         self.error_msg = ""
 
@@ -771,7 +1012,7 @@ def main():
                         choices=["cuda", "cpu"])
     parser.add_argument("--rtmpose-mode", type=str, default="balanced",
                         choices=["lightweight", "balanced", "performance"])
-    parser.add_argument("--reid-model", type=str, default="osnet_ain_x0_25",
+    parser.add_argument("--reid-model", type=str, default="osnet_ain_x1_0",
                         help="Re-ID 모델 이름")
     parser.add_argument("--load-calibration", type=str, default=None,
                         help="이전 캘리브레이션 결과 YAML 경로")
