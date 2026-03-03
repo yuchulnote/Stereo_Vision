@@ -311,8 +311,17 @@ class StereoAutoCalibApp:
         self.calibrator = AutoCalibrator(self.image_size)
 
         # ── 3D 파이프라인 (캘리브레이션 후 초기화) ──
-        self.mocap: MotionCapture3D = None
+        self._calib_data = None  # 캘리브레이션 결과 (mocap 인스턴스 생성용)
+        self.mocap_instances: dict = {}  # {gid: MotionCapture3D}
+        self._mocap_last_seen: dict = {}  # {gid: frame_idx} — 정리용
         self.visualizer: MotionCaptureVisualizer = None
+
+        # ── 3D 시점 보정 (카메라 틸트 자동 추정) ──
+        self._ground_rotation = np.eye(3)  # 보정 회전행렬
+        self._ground_translation = np.zeros(3)  # 바닥 원점 이동
+        self._body_up_samples = []  # 인체 수직 벡터 샘플
+        self._ground_calibrated = False
+        self._GROUND_SAMPLES_NEEDED = 30
 
         # ── 이전 캘리브레이션 로드 ──
         if load_calibration:
@@ -498,17 +507,19 @@ class StereoAutoCalibApp:
         )
 
         vis0, vis1 = frame0.copy(), frame1.copy()
-        valid_count = 0
+        total_joints = 0
         matched_tids_0 = set()
         matched_tids_1 = set()
 
-        # 첫 번째 매칭 쌍으로 3D 재구성
-        if matches and self.mocap:
-            track0, track1, gid = matches[0]
+        # ── 모든 매칭 쌍에 대해 3D 재구성 ──
+        all_skeletons = []  # [(landmarks_3d, valid_mask), ...]
+
+        for match_idx, (track0, track1, gid) in enumerate(matches):
+            color = self.MATCH_COLORS[match_idx % len(self.MATCH_COLORS)]
             matched_tids_0.add(track0.track_id)
             matched_tids_1.add(track1.track_id)
 
-            # COCO 17 → MediaPipe 33 변환 (정규화 좌표)
+            # COCO 17 → MediaPipe 33 변환
             lm0 = coco_to_mediapipe_landmarks(
                 track0.keypoints, track0.scores, self.image_size,
             )
@@ -516,23 +527,43 @@ class StereoAutoCalibApp:
                 track1.keypoints, track1.scores, self.image_size,
             )
 
-            landmarks_3d, valid_mask = self.mocap.process(lm0, lm1)
-            valid_count = int(valid_mask.sum())
+            # GID별 mocap 인스턴스로 3D 재구성 (개인별 필터링)
+            mocap = self._get_mocap(gid)
+            landmarks_3d, valid_mask = mocap.process(lm0, lm1)
+            total_joints += int(valid_mask.sum())
 
-            if self.visualizer:
-                self.visualizer.visualize_frame(landmarks_3d, valid_mask)
+            # 시점 보정: 첫 번째 매칭에서만 수직 벡터 수집
+            if match_idx == 0 and not self._ground_calibrated:
+                up_vec = self._collect_body_up_vector(landmarks_3d, valid_mask)
+                if up_vec is not None:
+                    self._body_up_samples.append(up_vec)
+                    if len(self._body_up_samples) >= self._GROUND_SAMPLES_NEEDED:
+                        self._estimate_ground_rotation()
 
-            # 메인 매칭 스켈레톤 (녹색)
-            draw_skeleton(vis0, track0.keypoints, track0.scores, (0, 255, 0))
-            draw_skeleton(vis1, track1.keypoints, track1.scores, (0, 255, 0))
+            landmarks_3d = self._apply_ground_correction(landmarks_3d, valid_mask)
+            all_skeletons.append((landmarks_3d, valid_mask))
 
-        # 나머지 매칭 쌍 (다른 색)
-        for match_idx, (t0, t1, gid) in enumerate(matches[1:], start=1):
-            color = self.MATCH_COLORS[match_idx % len(self.MATCH_COLORS)]
-            matched_tids_0.add(t0.track_id)
-            matched_tids_1.add(t1.track_id)
-            draw_skeleton(vis0, t0.keypoints, t0.scores, color)
-            draw_skeleton(vis1, t1.keypoints, t1.scores, color)
+            # 2D 스켈레톤 표시 (카메라 뷰)
+            draw_skeleton(vis0, track0.keypoints, track0.scores, color)
+            draw_skeleton(vis1, track1.keypoints, track1.scores, color)
+
+            # GID 라벨 표시
+            label = f"GID#{gid}"
+            bx0 = int(track0.bbox[0] + track0.bbox[2] / 2) - 20
+            by0 = max(15, track0.bbox[1] - 10)
+            bx1 = int(track1.bbox[0] + track1.bbox[2] / 2) - 20
+            by1 = max(15, track1.bbox[1] - 10)
+            cv2.putText(vis0, label, (bx0, by0),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            cv2.putText(vis1, label, (bx1, by1),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+        # 3D 시각화 전송 (모든 사람)
+        if self.visualizer and all_skeletons:
+            self.visualizer.visualize_frames(all_skeletons)
+
+        # 오래된 mocap 인스턴스 정리
+        self._prune_mocap_instances()
 
         # 매칭 안 된 사람 (회색)
         for t in self.tracker0.get_active_tracks():
@@ -545,10 +576,21 @@ class StereoAutoCalibApp:
         display = np.hstack([vis0, vis1])
 
         reproj = self.calibrator.calibration_result.get('reprojection_error', 0)
+
+        # 시점 보정 상태
+        if self._ground_calibrated:
+            ground_status = "View OK"
+        else:
+            ground_status = (
+                f"ViewCal {len(self._body_up_samples)}"
+                f"/{self._GROUND_SAMPLES_NEEDED}"
+            )
+
         info = (
-            f"[3D] Matches: {len(matches)}"
-            f" | Joints: {valid_count}"
+            f"[3D] Persons: {len(matches)}"
+            f" | Joints: {total_joints}"
             f" | Reproj: {reproj:.2f}px"
+            f" | {ground_status}"
         )
         cv2.putText(display, info, (20, display.shape[0] - 20),
                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
@@ -804,6 +846,105 @@ class StereoAutoCalibApp:
 
         return self._get_reid_crop(masked_frame, detection)
 
+    # ==================================================================
+    # 3D 시점 보정 (카메라 틸트 자동 추정)
+    # ==================================================================
+
+    def _collect_body_up_vector(self, landmarks_3d, valid_mask):
+        """3D 랜드마크에서 인체 수직 벡터(발목→어깨) 추출.
+
+        MediaPipe 인덱스: L_shoulder=11, R_shoulder=12,
+                        L_ankle=27, R_ankle=28
+        """
+        # 양쪽 어깨와 양쪽 발목이 모두 유효해야 함
+        needed = [11, 12, 27, 28]
+        if not all(valid_mask[i] for i in needed):
+            return None
+
+        shoulder_mid = (landmarks_3d[11] + landmarks_3d[12]) / 2.0
+        ankle_mid = (landmarks_3d[27] + landmarks_3d[28]) / 2.0
+
+        up_vec = shoulder_mid - ankle_mid  # 발목 → 어깨 방향
+        norm = np.linalg.norm(up_vec)
+        if norm < 50.0:  # 50mm 미만이면 무시 (노이즈)
+            return None
+
+        return up_vec / norm  # 단위 벡터
+
+    def _estimate_ground_rotation(self):
+        """수집된 인체 수직 벡터 샘플로 보정 회전행렬 계산.
+
+        카메라 좌표계에서 인체 수직 방향을 [0, -1, 0] (Y-up)으로 정렬하는
+        회전행렬을 Rodrigues 공식으로 계산한다.
+        """
+        if len(self._body_up_samples) < self._GROUND_SAMPLES_NEEDED:
+            return
+
+        # 중앙값 기반 평균 (이상치에 강건)
+        samples = np.array(self._body_up_samples)
+        avg_up = np.median(samples, axis=0)
+        avg_up = avg_up / np.linalg.norm(avg_up)
+
+        # 목표: 인체 수직 벡터 → [0, -1, 0] (카메라 좌표계에서 위쪽)
+        target_up = np.array([0.0, -1.0, 0.0])
+
+        # 이미 거의 정렬되어 있으면 보정 불필요
+        dot = np.dot(avg_up, target_up)
+        if dot > 0.999:
+            self._ground_rotation = np.eye(3)
+            self._ground_calibrated = True
+            print("[INFO] 3D 시점 보정: 카메라가 이미 수평 (보정 불필요)")
+            return
+
+        # Rodrigues 회전: avg_up → target_up
+        cross = np.cross(avg_up, target_up)
+        cross_norm = np.linalg.norm(cross)
+
+        if cross_norm < 1e-6:
+            # 반대 방향 (180도 회전) — X축 기준 180도
+            self._ground_rotation = np.diag([1.0, -1.0, -1.0])
+        else:
+            axis = cross / cross_norm
+            angle = np.arccos(np.clip(dot, -1.0, 1.0))
+
+            # Rodrigues 공식
+            K = np.array([
+                [0, -axis[2], axis[1]],
+                [axis[2], 0, -axis[0]],
+                [-axis[1], axis[0], 0],
+            ])
+            self._ground_rotation = (
+                np.eye(3)
+                + np.sin(angle) * K
+                + (1 - np.cos(angle)) * (K @ K)
+            )
+
+        self._ground_calibrated = True
+
+        # 틸트 각도 계산 (사용자 피드백용)
+        tilt_deg = np.degrees(np.arccos(np.clip(dot, -1.0, 1.0)))
+        print(f"[INFO] 3D 시점 보정 완료: 카메라 틸트 ≈ {tilt_deg:.1f}°")
+
+    def _apply_ground_correction(self, landmarks_3d, valid_mask):
+        """보정 회전행렬을 3D 랜드마크에 적용.
+
+        Returns:
+            보정된 landmarks_3d (원본은 수정하지 않음)
+        """
+        if not self._ground_calibrated:
+            return landmarks_3d
+
+        corrected = landmarks_3d.copy()
+        for i in range(len(corrected)):
+            if valid_mask[i]:
+                corrected[i] = self._ground_rotation @ corrected[i]
+
+        return corrected
+
+    # ==================================================================
+    # 3D 파이프라인 초기화
+    # ==================================================================
+
     def _init_3d_pipeline(self):
         """캘리브레이션 결과로 3D 파이프라인 초기화"""
         try:
@@ -813,12 +954,9 @@ class StereoAutoCalibApp:
                 self.error_msg = "calibration data is None"
                 return
 
-            self.mocap = MotionCapture3D(
-                calibration_data=calib_data,
-                confidence_threshold=0.5,
-                use_midpoint=True,
-                filter_enabled=True,
-            )
+            self._calib_data = calib_data
+            self.mocap_instances = {}
+            self._mocap_last_seen = {}
 
             self.visualizer = MotionCaptureVisualizer(use_matplotlib=True)
 
@@ -830,6 +968,28 @@ class StereoAutoCalibApp:
             self.error_msg = str(e)
             import traceback
             traceback.print_exc()
+
+    def _get_mocap(self, gid: int) -> MotionCapture3D:
+        """GID별 MotionCapture3D 인스턴스 (on-demand 생성)"""
+        if gid not in self.mocap_instances:
+            self.mocap_instances[gid] = MotionCapture3D(
+                calibration_data=self._calib_data,
+                confidence_threshold=0.5,
+                use_midpoint=True,
+                filter_enabled=True,
+            )
+        self._mocap_last_seen[gid] = self._frame_idx
+        return self.mocap_instances[gid]
+
+    def _prune_mocap_instances(self, max_age: int = 300):
+        """오래 안 보인 GID의 mocap 인스턴스 정리 (메모리)"""
+        stale = [
+            gid for gid, last in self._mocap_last_seen.items()
+            if self._frame_idx - last > max_age
+        ]
+        for gid in stale:
+            del self.mocap_instances[gid]
+            del self._mocap_last_seen[gid]
 
     def _manual_calibrate(self):
         """캘리브레이션 실행"""
@@ -866,7 +1026,9 @@ class StereoAutoCalibApp:
         """캘리브레이션 리셋"""
         print("[INFO] 캘리브레이션 리셋")
         self.calibrator.reset()
-        self.mocap = None
+        self.mocap_instances = {}
+        self._mocap_last_seen = {}
+        self._calib_data = None
         if self.visualizer:
             self.visualizer.close()
             self.visualizer = None
@@ -883,6 +1045,11 @@ class StereoAutoCalibApp:
         )
         self.global_manager = StereoGlobalIdentityManager(coord_transformer=None)
         self._frame_idx = 0
+        # 3D 시점 보정 초기화
+        self._ground_rotation = np.eye(3)
+        self._ground_translation = np.zeros(3)
+        self._body_up_samples = []
+        self._ground_calibrated = False
         self.state = State.CALIBRATING
         self.error_msg = ""
 
