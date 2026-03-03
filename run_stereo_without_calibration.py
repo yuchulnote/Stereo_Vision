@@ -244,6 +244,13 @@ class StereoAutoCalibApp:
     GRAY = (128, 128, 128)
     AUTO_CALIBRATE_THRESHOLD = 50  # 50포인트 이상이면 자동 캘리브레이션
 
+    # ── 프레임 스킵 설정 (성능 최적화) ──
+    # 매 DETECT_INTERVAL 프레임마다 전체 파이프라인 실행,
+    # 나머지 프레임은 캐시된 스켈레톤을 현재 카메라 프레임에 오버레이
+    DETECT_INTERVAL_3D = 5         # 3D 모드: 5프레임 중 1회 검출
+    DETECT_INTERVAL_CALIB = 3      # 캘리브레이션: 3프레임 중 1회 검출
+    REID_INTERVAL = 3              # Re-ID는 검출 프레임 중 3회당 1회
+
     def __init__(
         self,
         camera0_idx: int,
@@ -333,6 +340,11 @@ class StereoAutoCalibApp:
             except Exception as e:
                 print(f"[ERROR] 캘리브레이션 로드 실패: {e}")
 
+        # ── 프레임 스킵 & 캐시 ──
+        self._skip_counter = 0
+        self._reid_key_counter = 0
+        self._cached_draw = None   # 스킵 프레임에서 재사용할 스켈레톤 데이터
+
         # ── FPS 계산 ──
         self._frame_count = 0
         self._fps_start = time.time()
@@ -410,87 +422,110 @@ class StereoAutoCalibApp:
     # ==================================================================
 
     def _process_calibrating(self, frame0, frame1):
-        # ── 포즈 검출 ──
-        detections0 = self._detect_persons(frame0)
-        detections1 = self._detect_persons(frame1)
+        self._skip_counter += 1
+        is_key = (self._skip_counter % self.DETECT_INTERVAL_CALIB == 0)
 
-        # ── Overlord 풀 파이프라인 매칭 ──
-        matches = self._match_across_cameras(
-            frame0, frame1, detections0, detections1,
-        )
-
-        # ── 대응점 수집 + 시각화 ──
-        vis0, vis1 = frame0.copy(), frame1.copy()
-
-        matched_tids_0 = set()
-        matched_tids_1 = set()
-
-        for match_idx, (track0, track1, gid) in enumerate(matches):
-            color = self.MATCH_COLORS[match_idx % len(self.MATCH_COLORS)]
-            matched_tids_0.add(track0.track_id)
-            matched_tids_1.add(track1.track_id)
-
-            self.calibrator.add_correspondences(
-                track0.keypoints, track0.scores,
-                track1.keypoints, track1.scores,
+        if is_key:
+            # ── KEY FRAME: 전체 파이프라인 ──
+            detections0 = self._detect_persons(frame0)
+            detections1 = self._detect_persons(frame1)
+            matches = self._match_across_cameras(
+                frame0, frame1, detections0, detections1,
             )
 
-            draw_skeleton(vis0, track0.keypoints, track0.scores, color)
-            draw_skeleton(vis1, track1.keypoints, track1.scores, color)
+            # 대응점 수집
+            for track0, track1, gid in matches:
+                self.calibrator.add_correspondences(
+                    track0.keypoints, track0.scores,
+                    track1.keypoints, track1.scores,
+                )
 
-            # 매칭 ID 표시
-            label = f"GID#{gid}"
-            bx0 = int(track0.bbox[0] + track0.bbox[2] / 2) - 20
-            by0 = track0.bbox[1] - 10
-            bx1 = int(track1.bbox[0] + track1.bbox[2] / 2) - 20
-            by1 = track1.bbox[1] - 10
-            cv2.putText(vis0, label, (bx0, by0),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            cv2.putText(vis1, label, (bx1, by1),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            # 스켈레톤 데이터 캐시 (스킵 프레임 재사용)
+            draw_data = []
+            matched_tids_0, matched_tids_1 = set(), set()
+            for match_idx, (t0, t1, gid) in enumerate(matches):
+                matched_tids_0.add(t0.track_id)
+                matched_tids_1.add(t1.track_id)
+                draw_data.append((
+                    t0.keypoints.copy(), t0.scores.copy(),
+                    t1.keypoints.copy(), t1.scores.copy(),
+                    t0.bbox, t1.bbox, gid,
+                ))
 
-        # 매칭 안 된 active tracks (회색)
-        for t in self.tracker0.get_active_tracks():
-            if t.track_id not in matched_tids_0:
-                draw_skeleton(vis0, t.keypoints, t.scores, self.GRAY)
-        for t in self.tracker1.get_active_tracks():
-            if t.track_id not in matched_tids_1:
-                draw_skeleton(vis1, t.keypoints, t.scores, self.GRAY)
+            unmatched_0 = [
+                (t.keypoints.copy(), t.scores.copy())
+                for t in self.tracker0.get_active_tracks()
+                if t.track_id not in matched_tids_0
+            ]
+            unmatched_1 = [
+                (t.keypoints.copy(), t.scores.copy())
+                for t in self.tracker1.get_active_tracks()
+                if t.track_id not in matched_tids_1
+            ]
 
-        # ── 합성 + 오버레이 ──
+            self._cached_draw = {
+                'matches': draw_data,
+                'unmatched_0': unmatched_0,
+                'unmatched_1': unmatched_1,
+                'num_matches': len(matches),
+            }
+
+            # 자동 캘리브레이션 체크
+            if self.calibrator.is_ready() and \
+               self.calibrator.num_points >= self.AUTO_CALIBRATE_THRESHOLD:
+                self._manual_calibrate()
+
+        # ── DRAW (모든 프레임 — 캐시된 스켈레톤 + 현재 카메라 영상) ──
+        vis0, vis1 = frame0.copy(), frame1.copy()
+        cached = self._cached_draw
+        if cached:
+            for i, (kp0, sc0, kp1, sc1, bb0, bb1, gid) in enumerate(
+                    cached['matches']):
+                color = self.MATCH_COLORS[i % len(self.MATCH_COLORS)]
+                draw_skeleton(vis0, kp0, sc0, color)
+                draw_skeleton(vis1, kp1, sc1, color)
+                label = f"GID#{gid}"
+                cv2.putText(vis0, label,
+                            (int(bb0[0] + bb0[2] / 2) - 20,
+                             max(15, bb0[1] - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                cv2.putText(vis1, label,
+                            (int(bb1[0] + bb1[2] / 2) - 20,
+                             max(15, bb1[1] - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            for kp, sc in cached['unmatched_0']:
+                draw_skeleton(vis0, kp, sc, self.GRAY)
+            for kp, sc in cached['unmatched_1']:
+                draw_skeleton(vis1, kp, sc, self.GRAY)
+
+        # ── HUD 오버레이 ──
         display = np.hstack([vis0, vis1])
-        h_disp = display.shape[0]
-        w_disp = display.shape[1]
+        h_disp, w_disp = display.shape[:2]
         progress = self.calibrator.progress
 
-        # 진행률 바
         bar_y = h_disp - 50
         bar_w = w_disp - 40
         draw_progress_bar(display, progress, 20, bar_y, bar_w, 20)
 
+        n_matches = cached['num_matches'] if cached else 0
         info = (
             f"[CALIBRATING] Points: {self.calibrator.num_points}/30"
             f" | Coverage: {self.calibrator.coverage_count}/6"
-            f" | Matches: {len(matches)}"
+            f" | Matches: {n_matches}"
             f" ({'Re-ID' if self.reid else 'Single'})"
         )
         cv2.putText(display, info, (20, bar_y - 10),
                      cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-
-        pct_text = f"{int(progress * 100)}%"
-        cv2.putText(display, pct_text, (20 + bar_w // 2 - 15, bar_y + 15),
+        cv2.putText(display, f"{int(progress * 100)}%",
+                     (20 + bar_w // 2 - 15, bar_y + 15),
                      cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
-        # ready 상태 표시
         if self.calibrator.is_ready():
             cv2.putText(
-                display, "Ready! Press C to calibrate or collecting more...",
+                display, "Ready! Press C or collecting more...",
                 (20, bar_y - 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2,
             )
-            # 충분히 모이면 자동 캘리브레이션
-            if self.calibrator.num_points >= self.AUTO_CALIBRATE_THRESHOLD:
-                self._manual_calibrate()
 
         return display
 
@@ -499,85 +534,116 @@ class StereoAutoCalibApp:
     # ==================================================================
 
     def _process_3d(self, frame0, frame1):
-        detections0 = self._detect_persons(frame0)
-        detections1 = self._detect_persons(frame1)
+        self._skip_counter += 1
+        is_key = (self._skip_counter % self.DETECT_INTERVAL_3D == 0)
 
-        matches = self._match_across_cameras(
-            frame0, frame1, detections0, detections1,
-        )
+        if is_key:
+            # ── KEY FRAME: 검출 + 매칭 + 3D 재구성 ──
+            self._reid_key_counter += 1
+            skip_reid = (self._reid_key_counter % self.REID_INTERVAL != 0)
 
+            detections0 = self._detect_persons(frame0)
+            detections1 = self._detect_persons(frame1)
+            matches = self._match_across_cameras(
+                frame0, frame1, detections0, detections1,
+                skip_reid=skip_reid,
+            )
+
+            all_skeletons = []
+            total_joints = 0
+            draw_data = []
+            matched_tids_0, matched_tids_1 = set(), set()
+
+            for match_idx, (track0, track1, gid) in enumerate(matches):
+                matched_tids_0.add(track0.track_id)
+                matched_tids_1.add(track1.track_id)
+
+                # 3D 재구성
+                lm0 = coco_to_mediapipe_landmarks(
+                    track0.keypoints, track0.scores, self.image_size)
+                lm1 = coco_to_mediapipe_landmarks(
+                    track1.keypoints, track1.scores, self.image_size)
+
+                mocap = self._get_mocap(gid)
+                landmarks_3d, valid_mask = mocap.process(lm0, lm1)
+                total_joints += int(valid_mask.sum())
+
+                # 시점 보정 수집
+                if match_idx == 0 and not self._ground_calibrated:
+                    up_vec = self._collect_body_up_vector(
+                        landmarks_3d, valid_mask)
+                    if up_vec is not None:
+                        self._body_up_samples.append(up_vec)
+                        if len(self._body_up_samples) >= \
+                                self._GROUND_SAMPLES_NEEDED:
+                            self._estimate_ground_rotation()
+
+                landmarks_3d = self._apply_ground_correction(
+                    landmarks_3d, valid_mask)
+                all_skeletons.append((landmarks_3d, valid_mask))
+
+                # 2D 드로우 데이터 캐시
+                draw_data.append((
+                    track0.keypoints.copy(), track0.scores.copy(),
+                    track1.keypoints.copy(), track1.scores.copy(),
+                    track0.bbox, track1.bbox, gid,
+                ))
+
+            # 3D 시각화 전송
+            if self.visualizer and all_skeletons:
+                self.visualizer.visualize_frames(all_skeletons)
+
+            self._prune_mocap_instances()
+
+            # 매칭 안 된 트랙
+            unmatched_0 = [
+                (t.keypoints.copy(), t.scores.copy())
+                for t in self.tracker0.get_active_tracks()
+                if t.track_id not in matched_tids_0
+            ]
+            unmatched_1 = [
+                (t.keypoints.copy(), t.scores.copy())
+                for t in self.tracker1.get_active_tracks()
+                if t.track_id not in matched_tids_1
+            ]
+
+            self._cached_draw = {
+                'matches': draw_data,
+                'unmatched_0': unmatched_0,
+                'unmatched_1': unmatched_1,
+                'total_joints': total_joints,
+                'num_matches': len(matches),
+            }
+
+        # ── DRAW (모든 프레임 — 캐시된 스켈레톤 + 현재 카메라 프레임) ──
         vis0, vis1 = frame0.copy(), frame1.copy()
-        total_joints = 0
-        matched_tids_0 = set()
-        matched_tids_1 = set()
+        cached = self._cached_draw
 
-        # ── 모든 매칭 쌍에 대해 3D 재구성 ──
-        all_skeletons = []  # [(landmarks_3d, valid_mask), ...]
-
-        for match_idx, (track0, track1, gid) in enumerate(matches):
-            color = self.MATCH_COLORS[match_idx % len(self.MATCH_COLORS)]
-            matched_tids_0.add(track0.track_id)
-            matched_tids_1.add(track1.track_id)
-
-            # COCO 17 → MediaPipe 33 변환
-            lm0 = coco_to_mediapipe_landmarks(
-                track0.keypoints, track0.scores, self.image_size,
-            )
-            lm1 = coco_to_mediapipe_landmarks(
-                track1.keypoints, track1.scores, self.image_size,
-            )
-
-            # GID별 mocap 인스턴스로 3D 재구성 (개인별 필터링)
-            mocap = self._get_mocap(gid)
-            landmarks_3d, valid_mask = mocap.process(lm0, lm1)
-            total_joints += int(valid_mask.sum())
-
-            # 시점 보정: 첫 번째 매칭에서만 수직 벡터 수집
-            if match_idx == 0 and not self._ground_calibrated:
-                up_vec = self._collect_body_up_vector(landmarks_3d, valid_mask)
-                if up_vec is not None:
-                    self._body_up_samples.append(up_vec)
-                    if len(self._body_up_samples) >= self._GROUND_SAMPLES_NEEDED:
-                        self._estimate_ground_rotation()
-
-            landmarks_3d = self._apply_ground_correction(landmarks_3d, valid_mask)
-            all_skeletons.append((landmarks_3d, valid_mask))
-
-            # 2D 스켈레톤 표시 (카메라 뷰)
-            draw_skeleton(vis0, track0.keypoints, track0.scores, color)
-            draw_skeleton(vis1, track1.keypoints, track1.scores, color)
-
-            # GID 라벨 표시
-            label = f"GID#{gid}"
-            bx0 = int(track0.bbox[0] + track0.bbox[2] / 2) - 20
-            by0 = max(15, track0.bbox[1] - 10)
-            bx1 = int(track1.bbox[0] + track1.bbox[2] / 2) - 20
-            by1 = max(15, track1.bbox[1] - 10)
-            cv2.putText(vis0, label, (bx0, by0),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            cv2.putText(vis1, label, (bx1, by1),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-        # 3D 시각화 전송 (모든 사람)
-        if self.visualizer and all_skeletons:
-            self.visualizer.visualize_frames(all_skeletons)
-
-        # 오래된 mocap 인스턴스 정리
-        self._prune_mocap_instances()
-
-        # 매칭 안 된 사람 (회색)
-        for t in self.tracker0.get_active_tracks():
-            if t.track_id not in matched_tids_0:
-                draw_skeleton(vis0, t.keypoints, t.scores, self.GRAY)
-        for t in self.tracker1.get_active_tracks():
-            if t.track_id not in matched_tids_1:
-                draw_skeleton(vis1, t.keypoints, t.scores, self.GRAY)
+        if cached:
+            for i, (kp0, sc0, kp1, sc1, bb0, bb1, gid) in enumerate(
+                    cached['matches']):
+                color = self.MATCH_COLORS[i % len(self.MATCH_COLORS)]
+                draw_skeleton(vis0, kp0, sc0, color)
+                draw_skeleton(vis1, kp1, sc1, color)
+                label = f"GID#{gid}"
+                cv2.putText(vis0, label,
+                            (int(bb0[0] + bb0[2] / 2) - 20,
+                             max(15, bb0[1] - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                cv2.putText(vis1, label,
+                            (int(bb1[0] + bb1[2] / 2) - 20,
+                             max(15, bb1[1] - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            for kp, sc in cached['unmatched_0']:
+                draw_skeleton(vis0, kp, sc, self.GRAY)
+            for kp, sc in cached['unmatched_1']:
+                draw_skeleton(vis1, kp, sc, self.GRAY)
 
         display = np.hstack([vis0, vis1])
 
-        reproj = self.calibrator.calibration_result.get('reprojection_error', 0)
+        reproj = self.calibrator.calibration_result.get(
+            'reprojection_error', 0)
 
-        # 시점 보정 상태
         if self._ground_calibrated:
             ground_status = "View OK"
         else:
@@ -586,9 +652,11 @@ class StereoAutoCalibApp:
                 f"/{self._GROUND_SAMPLES_NEEDED}"
             )
 
+        n_matches = cached.get('num_matches', 0) if cached else 0
+        total_j = cached.get('total_joints', 0) if cached else 0
         info = (
-            f"[3D] Persons: {len(matches)}"
-            f" | Joints: {total_joints}"
+            f"[3D] Persons: {n_matches}"
+            f" | Joints: {total_j}"
             f" | Reproj: {reproj:.2f}px"
             f" | {ground_status}"
         )
@@ -668,15 +736,16 @@ class StereoAutoCalibApp:
         return [d for d, k in zip(detections, keep) if k]
 
     def _match_across_cameras(self, frame0, frame1,
-                               detections0, detections1):
+                               detections0, detections1,
+                               skip_reid=False):
         """Overlord 풀 파이프라인으로 크로스-카메라 매칭.
 
-        multi_camera_system.py와 동일한 파이프라인:
-        색상 히스토그램 → 겹침 마스킹 크롭 → Re-ID →
-        SingleCameraTracker → GlobalIdentityManager → 같은 GID 쌍 찾기.
+        Args:
+            skip_reid: True면 Re-ID 추출을 건너뛰고 zero feature 사용
+                       (프레임 스킵 최적화)
 
         Returns:
-            List[(LocalTrack, LocalTrack, int)] — (cam0 track, cam1 track, global_id)
+            List[(LocalTrack, LocalTrack, int)]
         """
         self._frame_idx += 1
         all_dets = {0: detections0, 1: detections1}
@@ -696,15 +765,16 @@ class StereoAutoCalibApp:
                         f[y1:y2, x1:x2])
 
         # ── 스켈레톤 기반 크롭 + 겹침 마스킹 + Re-ID 추출 ──
-        all_crops = []
-        crop_map = []  # (cam_id, det_idx)
         all_features = {0: [None] * len(detections0),
                         1: [None] * len(detections1)}
 
-        if self.reid:
+        if self.reid and not skip_reid:
+            all_crops = []
+            crop_map = []
             for cam_id, dets in all_dets.items():
                 for det_idx, det in enumerate(dets):
-                    other_bboxes = [d.bbox for j, d in enumerate(dets) if j != det_idx]
+                    other_bboxes = [d.bbox for j, d in enumerate(dets)
+                                    if j != det_idx]
                     crop = self._get_reid_crop_masked(
                         frames[cam_id], det, other_bboxes)
                     if crop is not None:
@@ -957,6 +1027,8 @@ class StereoAutoCalibApp:
             self._calib_data = calib_data
             self.mocap_instances = {}
             self._mocap_last_seen = {}
+            self._cached_draw = None  # 캘리브레이션 캐시 초기화
+            self._skip_counter = 0
 
             self.visualizer = MotionCaptureVisualizer(use_matplotlib=True)
 
@@ -1050,6 +1122,10 @@ class StereoAutoCalibApp:
         self._ground_translation = np.zeros(3)
         self._body_up_samples = []
         self._ground_calibrated = False
+        # 프레임 스킵 초기화
+        self._skip_counter = 0
+        self._reid_key_counter = 0
+        self._cached_draw = None
         self.state = State.CALIBRATING
         self.error_msg = ""
 

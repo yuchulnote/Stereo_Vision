@@ -14,7 +14,7 @@ import sys
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from motion_capture.triangulation import triangulate_landmarks
+from motion_capture.triangulation import triangulate_landmarks, triangulate_landmarks_batch
 from motion_capture.one_euro_filter import OneEuroFilter3D
 from utils.logger import get_logger
 
@@ -53,6 +53,10 @@ class MotionCapture3D:
         
         # 투영 행렬 계산
         self.P1, self.P2, self.K1, self.K2, self.R1, self.T1, self.R2, self.T2 = self._compute_projection_matrices()
+
+        # 이미지 크기 캐싱 (매 프레임 재계산 방지)
+        img_sz = calibration_data.get('image_size', (1920, 1080))
+        self._image_size = tuple(img_sz) if isinstance(img_sz, list) else img_sz
         
         # 필터 초기화 (각 랜드마크마다)
         self.filters: List[Optional[OneEuroFilter3D]] = []
@@ -116,27 +120,15 @@ class MotionCapture3D:
         """
         if timestamp is None:
             timestamp = time.time()
-        
-        # 이미지 크기 가져오기
-        image_size = tuple(self.calibration_data.get('image_size', (1920, 1080)))
-        if isinstance(image_size, list):
-            image_size = tuple(image_size)
-        
-        # 삼각 측량 수행
-        landmarks_3d, valid_mask = triangulate_landmarks(
+
+        # 배치 삼각측량 (cv2.triangulatePoints 한번 호출)
+        landmarks_3d, valid_mask = triangulate_landmarks_batch(
             landmarks_2d_0,
             landmarks_2d_1,
             self.P1,
             self.P2,
-            K1=self.K1,
-            K2=self.K2,
-            R1=self.R1,
-            T1=self.T1,
-            R2=self.R2,
-            T2=self.T2,
             confidence_threshold=self.confidence_threshold,
-            use_midpoint=self.use_midpoint,
-            image_size=image_size
+            image_size=self._image_size,
         )
         
         # 필터링 적용
