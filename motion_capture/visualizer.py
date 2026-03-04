@@ -68,7 +68,8 @@ PERSON_COLORS = [
 ]
 
 
-def visualization_process(data_queue: mp.Queue, stop_event: mp.Event):
+def visualization_process(data_queue: mp.Queue, stop_event: mp.Event,
+                          window_pos=None, window_size=None):
     """
     Matplotlib 시각화를 담당하는 별도 프로세스 함수.
 
@@ -88,7 +89,13 @@ def visualization_process(data_queue: mp.Queue, stop_event: mp.Event):
 
         print("Matplotlib 3D Viewer Process Initializing...")
 
-        fig = plt.figure(figsize=(10, 8), dpi=100)
+        # figsize를 window_size에 맞게 조정 (dpi=100 기준)
+        if window_size:
+            fw = window_size[0] / 100.0
+            fh = window_size[1] / 100.0
+        else:
+            fw, fh = 10, 8
+        fig = plt.figure(figsize=(fw, fh), dpi=100)
         fig.canvas.manager.set_window_title('Stereo Vision 3D Mocap')
         ax = fig.add_subplot(111, projection='3d')
         ax.view_init(elev=20, azim=20)
@@ -96,6 +103,15 @@ def visualization_process(data_queue: mp.Queue, stop_event: mp.Event):
         plt.ion()
         plt.show()
         plt.pause(0.1)
+
+        # 창 위치 설정 (TkAgg 백엔드)
+        if window_pos:
+            try:
+                fig.canvas.manager.window.wm_geometry(
+                    f"+{window_pos[0]}+{window_pos[1]}")
+            except Exception:
+                pass
+
         fig.canvas.flush_events()
 
         print("Matplotlib 3D Viewer Window Opened")
